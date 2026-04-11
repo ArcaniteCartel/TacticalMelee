@@ -1,18 +1,39 @@
-import { contextBridge } from 'electron'
+import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
+import type { TCStatePayload } from '../shared/types'
 
-// Expose a safe subset of Electron APIs to the renderer process.
-// Extend this as IPC channels are added between main and renderer.
+const api = {
+  // ── TC controls ──────────────────────────────────────────────────────────
+  startCombat: (): void => ipcRenderer.send('tc:start-combat'),
+  gmRelease:   (): void => ipcRenderer.send('tc:gm-release'),
+  pass:        (): void => ipcRenderer.send('tc:pass'),
+  pause:       (): void => ipcRenderer.send('tc:pause'),
+  resume:      (): void => ipcRenderer.send('tc:resume'),
+  nextRound:    (): void => ipcRenderer.send('tc:next-round'),
+  launchHUD:    (): void => ipcRenderer.send('tc:launch-hud'),
+  endBattle:    (): void => ipcRenderer.send('tc:end-battle'),
+  resetBattle:  (): void => ipcRenderer.send('tc:reset'),
+
+  // ── State subscription ────────────────────────────────────────────────────
+  onStateUpdate: (callback: (state: TCStatePayload) => void): void => {
+    ipcRenderer.removeAllListeners('tc:state-update')
+    ipcRenderer.on('tc:state-update', (_, payload: TCStatePayload) => callback(payload))
+  },
+  offStateUpdate: (): void => {
+    ipcRenderer.removeAllListeners('tc:state-update')
+  },
+}
+
 if (process.contextIsolated) {
   try {
     contextBridge.exposeInMainWorld('electron', electronAPI)
-    contextBridge.exposeInMainWorld('api', {})
+    contextBridge.exposeInMainWorld('api', api)
   } catch (error) {
     console.error(error)
   }
 } else {
-  // @ts-ignore (define in dts)
+  // @ts-ignore
   window.electron = electronAPI
-  // @ts-ignore (define in dts)
-  window.api = {}
+  // @ts-ignore
+  window.api = api
 }
