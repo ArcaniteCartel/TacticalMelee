@@ -14,6 +14,11 @@ const api = {
   endBattle:    (): void => ipcRenderer.send('tc:end-battle'),
   resetBattle:  (): void => ipcRenderer.send('tc:reset'),
 
+  // ── Dev log bridge (main process → DevTools console) ─────────────────────
+  onDevLog: (callback: (message: string) => void): void => {
+    ipcRenderer.on('tm:dev-log', (_, message: string) => callback(message))
+  },
+
   // ── State subscription ────────────────────────────────────────────────────
   onStateUpdate: (callback: (state: TCStatePayload) => void): void => {
     ipcRenderer.removeAllListeners('tc:state-update')

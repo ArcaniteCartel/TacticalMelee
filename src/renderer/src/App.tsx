@@ -8,6 +8,10 @@ import { GmControls }    from './components/GmControls'
 export default function App(): JSX.Element {
   const [settingsOpen, { open: openSettings, close: closeSettings }] = useDisclosure(false)
 
+  React.useEffect(() => {
+    window.api.onDevLog((message) => console.log(message))
+  }, [])
+
   return (
     <Box style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', backgroundColor: 'var(--tm-body-bg)' }}>
       <TopBar onSettingsOpen={openSettings} />

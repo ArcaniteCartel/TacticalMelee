@@ -5,6 +5,8 @@ import { createActor } from 'xstate'
 import { tcMachine } from './tc/tcMachine'
 import { ActivePlugin } from './plugins/ActivePlugin'
 import { createLanServer, LAN_PORT } from './server/lanServer'
+import { StageRegistry } from './stages/registry'
+import { logger } from './logger'
 import type { TCStatePayload } from '../shared/types'
 
 // ── Singletons ──────────────────────────────────────────────────────────────
@@ -17,6 +19,18 @@ const tcActor     = createActor(tcMachine)
 const lanServer   = createLanServer()
 
 let tickInterval: ReturnType<typeof setInterval> | null = null
+
+// Tracks previous subscription state to detect enter/exit/tick transitions
+let prevMachineState: string | null = null
+let prevStageIndex: number = -1
+
+// ── Dev log bridge ───────────────────────────────────────────────────────────
+// Forwards main-process log lines to the renderer DevTools console (dev only).
+function devLog(message: string): void {
+  if (is.dev) {
+    mainWindow?.webContents.send('tm:dev-log', message)
+  }
+}
 
 // ── Timer management ────────────────────────────────────────────────────────
 
@@ -43,14 +57,62 @@ tcActor.subscribe((snapshot) => {
   const { stages, currentStageIndex } = snapshot.context
   const currentStage = stages[currentStageIndex]
 
-  // Drive timer from subscription
+  // ── Stage Registry hook dispatch ─────────────────────────────────────────
+  //
+  // Detect lifecycle transitions by comparing against previous snapshot state.
+  //
+  // entering: just became stageActive, OR advanced to a new stage index
+  // exiting:  was stageActive and is now leaving (state change or stage advance)
+  // ticking:  staying in the same stageActive stage (a TICK just fired)
+
+  const entering = state === 'stageActive' &&
+    (prevMachineState !== 'stageActive' || prevStageIndex !== currentStageIndex)
+
+  const exiting = prevMachineState === 'stageActive' &&
+    (state !== 'stageActive' || prevStageIndex !== currentStageIndex)
+
+  const ticking = state === 'stageActive' &&
+    prevMachineState === 'stageActive' &&
+    prevStageIndex === currentStageIndex
+
+  if (exiting && prevStageIndex >= 0) {
+    const prevStage = stages[prevStageIndex]
+    if (prevStage) {
+      const handler = StageRegistry[prevStage.type]
+      if (handler) {
+        devLog(`[Stage:${prevStage.type}] onExit — "${prevStage.name}" (round ${snapshot.context.round})`)
+        handler.onExit(prevStage, snapshot.context)
+      }
+    }
+  }
+
+  if (entering && currentStage) {
+    const handler = StageRegistry[currentStage.type]
+    if (handler) {
+      devLog(`[Stage:${currentStage.type}] onEnter — "${currentStage.name}" (round ${snapshot.context.round})`)
+      handler.onEnter(currentStage, snapshot.context)
+    }
+  }
+
+  if (ticking && currentStage) {
+    const handler = StageRegistry[currentStage.type]
+    if (handler) {
+      devLog(`[Stage:${currentStage.type}] onTick — "${currentStage.name}" (round ${snapshot.context.round}, ${snapshot.context.timerSecondsRemaining}s remaining)`)
+      handler.onTick(currentStage, snapshot.context)
+    }
+  }
+
+  prevMachineState = state
+  prevStageIndex   = currentStageIndex
+
+  // ── Timer management ─────────────────────────────────────────────────────
   if (state === 'stageActive' && currentStage?.type === 'timed') {
     startTicker()
   } else {
     stopTicker()
   }
 
-  // Build broadcast payload
+  // ── Broadcast ────────────────────────────────────────────────────────────
   const payload: TCStatePayload = {
     machineState:          state,
     round:                 snapshot.context.round,
@@ -61,11 +123,13 @@ tcActor.subscribe((snapshot) => {
     totalBeats:            snapshot.context.totalBeats,
   }
 
-  // Push to GM Dashboard via IPC
   mainWindow?.webContents.send('tc:state-update', payload)
-
-  // Push to Group HUD (and future player HUDs) via WebSocket
   lanServer.broadcast({ type: 'TC_STATE', payload })
+
+  logger.debug(
+    { machineState: state, round: snapshot.context.round, stageIndex: currentStageIndex },
+    'TC state broadcast'
+  )
 })
 
 tcActor.start()
