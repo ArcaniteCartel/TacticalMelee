@@ -38,6 +38,7 @@ export interface TCStatePayload {
   currentStageIndex: number
   timerSecondsRemaining: number
   spinSecondsRemaining: number
+  backgroundOpsComplete: boolean
   beatsRemaining: number
   totalBeats: number
 }

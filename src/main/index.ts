@@ -150,6 +150,7 @@ tcActor.subscribe((snapshot) => {
     currentStageIndex:     snapshot.context.currentStageIndex,
     timerSecondsRemaining: snapshot.context.timerSecondsRemaining,
     spinSecondsRemaining:  snapshot.context.spinSecondsRemaining,
+    backgroundOpsComplete: snapshot.context.backgroundOpsComplete,
     beatsRemaining:        snapshot.context.beatsRemaining,
     totalBeats:            snapshot.context.totalBeats,
   }

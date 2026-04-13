@@ -18,14 +18,17 @@ export function GmControls(): JSX.Element {
   const isIdle        = machineState === 'idle'
   const isActive      = machineState === 'stageActive'
   const isPaused      = machineState === 'stagePaused'
+  const isSpin        = machineState === 'stageSpin'
   const isComplete    = machineState === 'tcComplete'
   const isBattleEnded = machineState === 'battleEnded'
 
   const currentStage  = tc?.stages[tc.currentStageIndex ?? 0]
-  const canRelease    = isActive && currentStage?.type === 'gm-release'
+  const inCombat      = !isIdle
+  const canRelease    = (isActive && currentStage?.type === 'gm-release') ||
+                        (isSpin && tc?.backgroundOpsComplete === true)
+  const showRelease   = inCombat && !isComplete && !isBattleEnded
   const canPass       = (isActive || isPaused) && currentStage?.canPass === true
   const canPause      = isActive && currentStage?.type === 'timed'
-  const inCombat      = !isIdle
   const canEndBattle  = !isIdle && !isBattleEnded
   const canReset      = true
 
@@ -89,11 +92,12 @@ export function GmControls(): JSX.Element {
           </Button>
         )}
 
-        {canRelease && (
+        {showRelease && (
           <Button
             leftSection={<IconFlag size={16} />}
             color="var(--tm-accent)"
             variant="filled"
+            disabled={!canRelease}
             onClick={() => window.api.gmRelease()}
           >
             GM Release

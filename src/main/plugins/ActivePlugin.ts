@@ -35,7 +35,7 @@ export class ActivePlugin {
         description:
           'Make pre-combat adjustments — swap weapons, consume items, or declare readiness. 4 beats remain.',
         roundVisibility: [],
-        spinTime: 1,
+        spinTime: 3,
       },
     ],
   }

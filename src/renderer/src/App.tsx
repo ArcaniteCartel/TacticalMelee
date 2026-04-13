@@ -1,7 +1,6 @@
 import React, { useState } from 'react'
 import { useDisclosure } from '@mantine/hooks'
-import { Box, Container, Text, Stack, Divider, Badge, Group, Paper, Alert, CloseButton } from '@mantine/core'
-import { IconAlertTriangle } from '@tabler/icons-react'
+import { Box, Container, Text, Stack, Divider, Badge, Group, Paper } from '@mantine/core'
 import { TopBar }        from './components/TopBar'
 import { SettingsDrawer } from './components/SettingsDrawer'
 import { GmControls }    from './components/GmControls'
@@ -17,28 +16,14 @@ export default function App(): JSX.Element {
 
   return (
     <Box style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', backgroundColor: 'var(--tm-body-bg)' }}>
-      <TopBar onSettingsOpen={openSettings} />
+      <TopBar
+        onSettingsOpen={openSettings}
+        gmAlerts={gmAlerts}
+        onDismissAlert={(i) => setGmAlerts(prev => prev.filter((_, j) => j !== i))}
+      />
 
       <Container size="md" style={{ flex: 1, paddingTop: '2rem', paddingBottom: '2rem' }}>
         <Stack gap="xl">
-
-          {/* GM Alerts */}
-          {gmAlerts.length > 0 && (
-            <Stack gap="xs">
-              {gmAlerts.map((msg, i) => (
-                <Alert
-                  key={i}
-                  icon={<IconAlertTriangle size={16} />}
-                  color="red"
-                  title="Plugin Error"
-                  withCloseButton
-                  onClose={() => setGmAlerts(prev => prev.filter((_, j) => j !== i))}
-                >
-                  {msg}
-                </Alert>
-              ))}
-            </Stack>
-          )}
 
           {/* Combat controls */}
           <GmControls />
