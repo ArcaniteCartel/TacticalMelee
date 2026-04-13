@@ -19,6 +19,11 @@ const api = {
     ipcRenderer.on('tm:dev-log', (_, message: string) => callback(message))
   },
 
+  // ── GM Alert (critical errors that could block the game) ──────────────────
+  onGmAlert: (callback: (message: string) => void): void => {
+    ipcRenderer.on('tm:gm-alert', (_, message: string) => callback(message))
+  },
+
   // ── State subscription ────────────────────────────────────────────────────
   onStateUpdate: (callback: (state: TCStatePayload) => void): void => {
     ipcRenderer.removeAllListeners('tc:state-update')

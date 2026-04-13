@@ -1,15 +1,18 @@
-import React from 'react'
+import React, { useState } from 'react'
 import { useDisclosure } from '@mantine/hooks'
-import { Box, Container, Title, Text, Stack, Divider, Badge, Group, Paper } from '@mantine/core'
+import { Box, Container, Text, Stack, Divider, Badge, Group, Paper, Alert, CloseButton } from '@mantine/core'
+import { IconAlertTriangle } from '@tabler/icons-react'
 import { TopBar }        from './components/TopBar'
 import { SettingsDrawer } from './components/SettingsDrawer'
 import { GmControls }    from './components/GmControls'
 
 export default function App(): JSX.Element {
   const [settingsOpen, { open: openSettings, close: closeSettings }] = useDisclosure(false)
+  const [gmAlerts, setGmAlerts] = useState<string[]>([])
 
   React.useEffect(() => {
     window.api.onDevLog((message) => console.log(message))
+    window.api.onGmAlert((message) => setGmAlerts(prev => [...prev, message]))
   }, [])
 
   return (
@@ -18,6 +21,24 @@ export default function App(): JSX.Element {
 
       <Container size="md" style={{ flex: 1, paddingTop: '2rem', paddingBottom: '2rem' }}>
         <Stack gap="xl">
+
+          {/* GM Alerts */}
+          {gmAlerts.length > 0 && (
+            <Stack gap="xs">
+              {gmAlerts.map((msg, i) => (
+                <Alert
+                  key={i}
+                  icon={<IconAlertTriangle size={16} />}
+                  color="red"
+                  title="Plugin Error"
+                  withCloseButton
+                  onClose={() => setGmAlerts(prev => prev.filter((_, j) => j !== i))}
+                >
+                  {msg}
+                </Alert>
+              ))}
+            </Stack>
+          )}
 
           {/* Combat controls */}
           <GmControls />

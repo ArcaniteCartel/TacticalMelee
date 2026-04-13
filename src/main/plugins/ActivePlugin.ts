@@ -22,6 +22,8 @@ export class ActivePlugin {
         beats: 0,
         description:
           'The GM is setting the scene. Listen for narrative context before the encounter begins.',
+        roundVisibility: [],
+        spinTime: 0,
       },
       {
         id: 'pre-encounter',
@@ -32,6 +34,8 @@ export class ActivePlugin {
         canPass: true,
         description:
           'Make pre-combat adjustments — swap weapons, consume items, or declare readiness. 4 beats remain.',
+        roundVisibility: [],
+        spinTime: 1,
       },
     ],
   }

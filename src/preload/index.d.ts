@@ -12,6 +12,7 @@ interface TacticalMeleeAPI {
   endBattle:      () => void
   resetBattle:    () => void
   onDevLog:       (callback: (message: string) => void) => void
+  onGmAlert:      (callback: (message: string) => void) => void
   onStateUpdate:  (callback: (state: TCStatePayload) => void) => void
   offStateUpdate: () => void
 }

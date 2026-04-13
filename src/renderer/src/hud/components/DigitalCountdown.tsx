@@ -1,6 +1,6 @@
 import React from 'react'
 import { Stack, Text, Box } from '@mantine/core'
-import { IconUser, IconSettings, IconPlayerPause, IconFlagCheck } from '@tabler/icons-react'
+import { IconUser, IconSettings, IconPlayerPause, IconFlagCheck, IconHourglass } from '@tabler/icons-react'
 import type { TCStatePayload } from '@shared/types'
 
 interface DigitalCountdownProps {
@@ -13,6 +13,18 @@ function pad(n: number): string {
 
 export function DigitalCountdown({ state }: DigitalCountdownProps): JSX.Element {
   const stage = state.stages[state.currentStageIndex]
+
+  // Spin state — post-completion hourglass pause
+  if (state.machineState === 'stageSpin') {
+    return (
+      <Stack gap={6} align="center">
+        <IconHourglass size={32} color="var(--tm-accent)" />
+        <Text size="xs" c="dimmed" tt="uppercase" fw={600} style={{ letterSpacing: '0.08em' }}>
+          Processing
+        </Text>
+      </Stack>
+    )
+  }
 
   // TC complete
   if (state.machineState === 'tcComplete') {

@@ -6,6 +6,7 @@ import { tcMachine } from './tc/tcMachine'
 import { ActivePlugin } from './plugins/ActivePlugin'
 import { createLanServer, LAN_PORT } from './server/lanServer'
 import { StageRegistry } from './stages/registry'
+import { filterStagesForRound, validateStagesRoundVisibility } from './stages/roundVisibilityUtils'
 import { logger } from './logger'
 import type { TCStatePayload } from '../shared/types'
 
@@ -18,11 +19,26 @@ const activePlugin = new ActivePlugin()
 const tcActor     = createActor(tcMachine)
 const lanServer   = createLanServer()
 
-let tickInterval: ReturnType<typeof setInterval> | null = null
+let tickInterval:     ReturnType<typeof setInterval> | null = null
+let spinTickInterval: ReturnType<typeof setInterval> | null = null
 
 // Tracks previous subscription state to detect enter/exit/tick transitions
 let prevMachineState: string | null = null
 let prevStageIndex: number = -1
+
+// ── Timer management ─────────────────────────────────────────────────────────
+
+function startSpinTicker(): void {
+  if (spinTickInterval) return
+  spinTickInterval = setInterval(() => tcActor.send({ type: 'SPIN_TICK' }), 1000)
+}
+
+function stopSpinTicker(): void {
+  if (spinTickInterval) {
+    clearInterval(spinTickInterval)
+    spinTickInterval = null
+  }
+}
 
 // ── Dev log bridge ───────────────────────────────────────────────────────────
 // Forwards main-process log lines to the renderer DevTools console (dev only).
@@ -30,6 +46,14 @@ function devLog(message: string): void {
   if (is.dev) {
     mainWindow?.webContents.send('tm:dev-log', message)
   }
+}
+
+// ── GM Alert ────────────────────────────────────────────────────────────────
+// Surfaces critical errors to the GM's console UI and the log.
+function gmAlert(message: string): void {
+  mainWindow?.webContents.send('tm:gm-alert', message)
+  logger.error({ alert: message }, 'GM Alert')
+  console.error(`[GM ALERT] ${message}`)
 }
 
 // ── Timer management ────────────────────────────────────────────────────────
@@ -112,6 +136,12 @@ tcActor.subscribe((snapshot) => {
     stopTicker()
   }
 
+  if (state === 'stageSpin') {
+    startSpinTicker()
+  } else {
+    stopSpinTicker()
+  }
+
   // ── Broadcast ────────────────────────────────────────────────────────────
   const payload: TCStatePayload = {
     machineState:          state,
@@ -119,6 +149,7 @@ tcActor.subscribe((snapshot) => {
     stages:                snapshot.context.stages,
     currentStageIndex:     snapshot.context.currentStageIndex,
     timerSecondsRemaining: snapshot.context.timerSecondsRemaining,
+    spinSecondsRemaining:  snapshot.context.spinSecondsRemaining,
     beatsRemaining:        snapshot.context.beatsRemaining,
     totalBeats:            snapshot.context.totalBeats,
   }
@@ -137,8 +168,9 @@ tcActor.start()
 // ── IPC handlers ────────────────────────────────────────────────────────────
 
 ipcMain.on('tc:start-combat', () => {
-  const stages     = activePlugin.getStages()
+  const allStages  = activePlugin.getStages()
   const beatsPerTC = activePlugin.getBeatsPerTC()
+  const stages     = filterStagesForRound(allStages, 1)
   tcActor.send({ type: 'START_COMBAT', stages, beatsPerTC })
 })
 
@@ -146,7 +178,11 @@ ipcMain.on('tc:gm-release', () => tcActor.send({ type: 'GM_RELEASE' }))
 ipcMain.on('tc:pass',       () => tcActor.send({ type: 'PASS' }))
 ipcMain.on('tc:pause',      () => tcActor.send({ type: 'PAUSE' }))
 ipcMain.on('tc:resume',     () => tcActor.send({ type: 'RESUME' }))
-ipcMain.on('tc:next-round', () => tcActor.send({ type: 'NEXT_ROUND' }))
+ipcMain.on('tc:next-round', () => {
+  const nextRound = tcActor.getSnapshot().context.round + 1
+  const stages    = filterStagesForRound(activePlugin.getStages(), nextRound)
+  tcActor.send({ type: 'NEXT_ROUND', stages })
+})
 ipcMain.on('tc:end-battle', () => tcActor.send({ type: 'END_BATTLE' }))
 ipcMain.on('tc:reset',      () => tcActor.send({ type: 'RESET' }))
 
@@ -230,6 +266,13 @@ app.whenReady().then(() => {
 
   createWindow()
 
+  // Validate plugin configuration after window is ready so alerts can reach the GM console
+  mainWindow?.once('ready-to-show', () => {
+    const { errors, warnings } = validateStagesRoundVisibility(activePlugin.getStages())
+    warnings.forEach(w => logger.warn({ warning: w }, 'Plugin config warning'))
+    errors.forEach(e => gmAlert(`Plugin configuration error: ${e}`))
+  })
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
@@ -237,6 +280,7 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   stopTicker()
+  stopSpinTicker()
   lanServer.close()
   if (process.platform !== 'darwin') app.quit()
 })
