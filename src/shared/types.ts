@@ -47,7 +47,7 @@ export interface PluginConfig {
 
 // The state payload broadcast to all clients on every TC state change.
 export interface TCStatePayload {
-  machineState: string   // 'idle' | 'stageActive' | 'stagePaused' | 'stageSpin' | 'stageSpinPaused' | 'tcComplete' | 'battleEnded'
+  machineState: string   // 'idle' | 'stageGMHold' | 'stageActive' | 'stagePaused' | 'stageSpin' | 'stageSpinPaused' | 'tcComplete' | 'battleEnded'
   round: number
   stages: StageDefinition[]
   currentStageIndex: number

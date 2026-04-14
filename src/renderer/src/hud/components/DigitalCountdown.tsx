@@ -18,6 +18,18 @@ function pad(n: number): string {
 export function DigitalCountdown({ state }: DigitalCountdownProps): JSX.Element {
   const stage = state.stages[state.currentStageIndex]
 
+  // GM Hold — waiting for GM to release before player countdown starts
+  if (state.machineState === 'stageGMHold') {
+    return (
+      <Stack gap={6} align="center">
+        <IconUser size={32} color="var(--tm-accent)" />
+        <Text size="xs" c="var(--tm-accent)" tt="uppercase" fw={600} style={{ letterSpacing: '0.08em' }}>
+          GM
+        </Text>
+      </Stack>
+    )
+  }
+
   // Spin state — post-completion hourglass pause
   if (state.machineState === 'stageSpin') {
     return (

@@ -11,6 +11,9 @@ function getIcon(state: TCStatePayload): JSX.Element | null {
   const stage = state.stages[state.currentStageIndex]
   if (!stage) return null
 
+  if (state.machineState === 'stageGMHold') {
+    return <IconUser size={20} color="var(--tm-accent)" />
+  }
   if (state.machineState === 'stagePaused') {
     return <IconPlayerPause size={20} color="var(--tm-warning)" />
   }
@@ -26,6 +29,11 @@ function getIcon(state: TCStatePayload): JSX.Element | null {
 function getMessage(state: TCStatePayload): string {
   if (state.machineState === 'tcComplete') return 'Round complete. Awaiting GM.'
   if (state.machineState === 'stagePaused') return 'Combat paused.'
+  if (state.machineState === 'stageGMHold') {
+    const stage = state.stages[state.currentStageIndex]
+    const label = stage?.type === 'response' ? 'response' : 'action'
+    return `GM is preparing NPC ${label}s — stand by.`
+  }
 
   const stage = state.stages[state.currentStageIndex]
   return stage?.description ?? ''

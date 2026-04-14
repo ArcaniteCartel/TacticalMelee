@@ -86,15 +86,17 @@ tcActor.subscribe((snapshot) => {
   //
   // Detect lifecycle transitions by comparing against previous snapshot state.
   //
-  // entering: just became stageActive, OR advanced to a new stage index
-  // exiting:  was stageActive and is now leaving (state change or stage advance)
-  // ticking:  staying in the same stageActive stage (a TICK just fired)
+  // "In stage" = stageActive OR stageGMHold (both represent an active stage).
+  // entering: just entered an in-stage state for a new stage index
+  //           stageGMHold → stageActive on the SAME stage does NOT re-fire onEnter
+  // exiting:  was in-stage and is now leaving (or advancing to next stage)
+  // ticking:  staying in stageActive, same index (a TICK just fired)
 
-  const entering = state === 'stageActive' &&
-    (prevMachineState !== 'stageActive' || prevStageIndex !== currentStageIndex)
+  const isInStage  = state === 'stageActive' || state === 'stageGMHold'
+  const wasInStage = prevMachineState === 'stageActive' || prevMachineState === 'stageGMHold'
 
-  const exiting = prevMachineState === 'stageActive' &&
-    (state !== 'stageActive' || prevStageIndex !== currentStageIndex)
+  const entering = isInStage && (!wasInStage || prevStageIndex !== currentStageIndex)
+  const exiting  = wasInStage && (!isInStage || prevStageIndex !== currentStageIndex)
 
   const ticking = state === 'stageActive' &&
     prevMachineState === 'stageActive' &&

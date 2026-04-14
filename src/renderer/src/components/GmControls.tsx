@@ -1,13 +1,14 @@
 import React, { useEffect, useState } from 'react'
-import { Stack, Group, Button, Paper, Text, Badge, Divider } from '@mantine/core'
+import { Stack, Group, Button, Paper, Text, Badge, Divider, CloseButton } from '@mantine/core'
 import {
   IconSwords, IconPlayerPlay, IconPlayerPause, IconPlayerSkipForward,
-  IconFlag, IconDeviceTv, IconSkull, IconRotateClockwise,
+  IconFlag, IconDeviceTv, IconSkull, IconRotateClockwise, IconClock,
 } from '@tabler/icons-react'
 import type { TCStatePayload } from '@shared/types'
 
 export function GmControls(): JSX.Element {
   const [tc, setTc] = useState<TCStatePayload | null>(null)
+  const [gmHoldDismissed, setGmHoldDismissed] = useState(false)
 
   useEffect(() => {
     window.api.onStateUpdate((state) => setTc(state))
@@ -16,6 +17,7 @@ export function GmControls(): JSX.Element {
 
   const machineState   = tc?.machineState ?? 'idle'
   const isIdle         = machineState === 'idle'
+  const isGMHold       = machineState === 'stageGMHold'
   const isActive       = machineState === 'stageActive'
   const isPaused       = machineState === 'stagePaused'
   const isSpin         = machineState === 'stageSpin'
@@ -26,26 +28,36 @@ export function GmControls(): JSX.Element {
   const currentStage   = tc?.stages[tc.currentStageIndex ?? 0]
   const inCombat       = !isIdle
 
-  // GM Release: ends stage early (partial beats consumed).
-  // Enabled on gm-release type stages, timed-like stages (have timerSeconds), and during spin when ops complete.
-  const canRelease     = (isActive && (currentStage?.type === 'gm-release' || (currentStage?.timerSeconds ?? 0) > 0)) ||
+  // Reset banner dismiss whenever a new GM hold is entered
+  useEffect(() => {
+    if (isGMHold) setGmHoldDismissed(false)
+  }, [isGMHold])
+
+  // GM Release:
+  //   stageGMHold  → starts the player countdown (always enabled)
+  //   stageActive  → ends stage early, partial beats consumed
+  //   stageSpin    → ends spin early when ops complete
+  const canRelease     = isGMHold ||
+                         (isActive && (currentStage?.type === 'gm-release' || (currentStage?.timerSeconds ?? 0) > 0)) ||
                          (isSpin && tc?.backgroundOpsComplete === true)
   const showRelease    = inCombat && !isComplete && !isBattleEnded
 
-  // GM Pass: skips stage, zero beats consumed.
-  const canPass        = (isActive || isPaused) && currentStage?.canPass === true
+  // GM Pass: skips stage, zero beats consumed. Available in hold phase (skips before timer starts).
+  const canPass        = (isGMHold || isActive || isPaused) && currentStage?.canPass === true
 
-  // Pause: allowed for all non-gm-release stages (stageActive or stageSpin)
+  // Pause: all non-gm-release stages in stageActive or stageSpin. NOT during stageGMHold.
   const canPause       = (isActive && currentStage?.type !== 'gm-release') || isSpin
   const canResume      = isPaused || isSpinPaused
 
   const canEndBattle   = !isIdle && !isBattleEnded
   const canReset       = true
 
+  const showGMHoldBanner = isGMHold && !gmHoldDismissed
+
   function statusColor(): string {
-    if (isComplete)              return 'yellow'
+    if (isComplete)               return 'yellow'
     if (isPaused || isSpinPaused) return 'orange'
-    if (isActive || isSpin)      return 'green'
+    if (isActive || isSpin || isGMHold) return 'green'
     return 'gray'
   }
 
@@ -71,6 +83,11 @@ export function GmControls(): JSX.Element {
           )}
         </Group>
 
+        {isGMHold && (
+          <Text size="xs" c="var(--tm-accent)" mt={4}>
+            ⏳ GM hold — release to start player countdown
+          </Text>
+        )}
         {isActive && (tc?.timerSecondsRemaining ?? 0) > 0 && (
           <Text size="xs" c="var(--tm-accent)" mt={4}>
             ⏱ {tc!.timerSecondsRemaining}s remaining
@@ -82,6 +99,32 @@ export function GmControls(): JSX.Element {
           </Text>
         )}
       </Paper>
+
+      {/* GM Hold info banner — shown while HUD is waiting for GM to release or pass */}
+      {showGMHoldBanner && (
+        <Paper
+          p="sm"
+          style={{
+            backgroundColor: 'color-mix(in srgb, var(--tm-accent) 12%, transparent)',
+            border: '1px solid var(--tm-accent)',
+            borderRadius: 'var(--mantine-radius-default)',
+          }}
+        >
+          <Group justify="space-between" align="center" wrap="nowrap">
+            <Group gap="xs" align="center" wrap="nowrap">
+              <IconClock size={14} color="var(--tm-accent)" style={{ flexShrink: 0 }} />
+              <Text size="xs" c="var(--tm-accent)" fw={600}>
+                HUD waiting for GM — release to start player countdown, or pass to skip stage
+              </Text>
+            </Group>
+            <CloseButton
+              size="xs"
+              style={{ color: 'var(--tm-accent)', flexShrink: 0 }}
+              onClick={() => setGmHoldDismissed(true)}
+            />
+          </Group>
+        </Paper>
+      )}
 
       <Divider color="var(--tm-border)" />
 

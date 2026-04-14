@@ -7,6 +7,7 @@
  *
  * States:
  *   idle            → waiting for combat to start
+ *   stageGMHold     → action/response: GM prep phase before player countdown starts (no timer)
  *   stageActive     → a stage is currently running
  *   checkAdvance    → transient: decides next stage or TC complete
  *   stagePaused     → a stage is paused by GM (resumes to stageActive)
@@ -21,9 +22,9 @@
  *   SPIN_TICK       → decrements spin timer in stageSpin
  *   SPIN_COMPLETE   → background ops finished; advance if spin timer also done
  *   SPIN_EXCEPTION  → background ops failed; advance immediately (GM alerted externally)
- *   GM_RELEASE      → ends stage early (partial beats consumed); ends spin early if ops complete
+ *   GM_RELEASE      → stageGMHold: starts player countdown; stageActive: ends early (partial beats); spin: ends early
  *   PASS            → skips stage entirely (zero beats consumed); any stage with canPass:true
- *   PAUSE           → pauses any non-gm-release stage (stageActive or stageSpin)
+ *   PAUSE           → pauses any non-gm-release stage (stageActive or stageSpin); NOT stageGMHold
  *   RESUME          → resumes from stagePaused or stageSpinPaused
  *   NEXT_ROUND      → tcComplete → stageActive (round increments, new filtered stages)
  *   END_BATTLE      → any active state → battleEnded
@@ -83,6 +84,15 @@ function getTimerSeconds(stage: StageDefinition): number {
 
 function getSpinTime(stage: StageDefinition): number {
   return stage.spinTime ?? 0
+}
+
+/**
+ * Returns true for stage types that enter a GM hold phase before the player countdown starts.
+ * In this phase the timer does not run and beats do not tick. GM Release starts the timer;
+ * GM Pass skips the stage entirely (zero beats, no spin).
+ */
+function isGMHoldStageType(stage: StageDefinition): boolean {
+  return stage.type === 'action' || stage.type === 'response'
 }
 
 /**
@@ -328,8 +338,27 @@ export const tcMachine = createMachine({
     // beatsRemaining is NOT recomputed here — it is already correct from the previous stage's
     // exit assignment (natural expiry → full beats charged; GM Release → partial; GM Pass → zero).
     // Recomputing from stage.beats would overwrite partial consumption with the full stage total.
+    // action/response stages enter stageGMHold first (GM prep phase before timer starts).
     checkAdvance: {
       always: [
+        {
+          // action/response: enter GM hold phase — timer has not started yet
+          guard: ({ context }) => {
+            const nextIndex = context.currentStageIndex + 1
+            if (nextIndex >= context.stages.length) return false
+            return isGMHoldStageType(context.stages[nextIndex])
+          },
+          target: 'stageGMHold',
+          actions: assign(({ context }) => {
+            const nextIndex = context.currentStageIndex + 1
+            return {
+              currentStageIndex: nextIndex,
+              timerSecondsRemaining: 0,   // timer has not started; set when GM releases
+              spinSecondsRemaining: 0,
+              beatsAtStageEntry: context.beatsRemaining,
+            }
+          }),
+        },
         {
           guard: ({ context }) => context.currentStageIndex + 1 < context.stages.length,
           target: 'stageActive',
@@ -348,6 +377,44 @@ export const tcMachine = createMachine({
           target: 'tcComplete',
         },
       ],
+    },
+
+    /**
+     * GM Hold state: action/response stages enter here before the player countdown starts.
+     * The GM uses this window to plan NPC actions/responses before opening the player timer.
+     * Timer does not run; beats do not tick. No pause allowed (serves no purpose with no timer).
+     *
+     * GM Release → stageActive  (starts the player countdown and beat burndown)
+     * GM Pass    → checkAdvance (skips stage entirely; zero beats; no spin)
+     */
+    stageGMHold: {
+      on: {
+        // GM Release: start the player countdown — set the timer, transition to stageActive
+        GM_RELEASE: {
+          target: 'stageActive',
+          actions: assign(({ context }) => {
+            const stage = context.stages[context.currentStageIndex]
+            return {
+              timerSecondsRemaining: getTimerSeconds(stage),
+            }
+          }),
+        },
+
+        // GM Pass: skip stage entirely — zero beats, bypass spin (nothing ran, nothing to compute)
+        PASS: {
+          guard: ({ context }) => {
+            const stage = context.stages[context.currentStageIndex]
+            return !!stage && stage.canPass === true
+          },
+          actions: assign(({ context }) => ({
+            beatsRemaining: context.beatsAtStageEntry,
+          })),
+          target: 'checkAdvance',
+        },
+
+        END_BATTLE: { target: 'battleEnded' },
+        RESET:      { target: 'idle', actions: assign(RESET_CONTEXT) },
+      },
     },
 
     /**
