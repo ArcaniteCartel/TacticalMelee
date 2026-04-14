@@ -12,10 +12,25 @@
  */
 export type RoundVisibilityEntry = `A${number}` | `I${number}`
 
+export type StageType =
+  | 'gm-release'
+  | 'timed'
+  | 'system-complete'
+  | 'surprise-determination'
+  | 'initiative-determination'
+  | 'action'
+  | 'response'
+  | 'resolution'
+
+/** Returns true for stage types that use a real-time countdown timer. */
+export function isTimedStageType(type: StageType): boolean {
+  return type === 'timed' || type === 'action' || type === 'response'
+}
+
 export interface StageDefinition {
   id: string
   name: string
-  type: 'gm-release' | 'timed' | 'system-complete'
+  type: StageType
   beats: number                                // in-world beats consumed by this stage
   timerSeconds?: number                        // real-world seconds (timed stages only)
   canPass?: boolean                            // players or GM can pass this stage early
@@ -32,7 +47,7 @@ export interface PluginConfig {
 
 // The state payload broadcast to all clients on every TC state change.
 export interface TCStatePayload {
-  machineState: string   // 'idle' | 'stageActive' | 'stagePaused' | 'stageSpin' | 'tcComplete' | 'battleEnded'
+  machineState: string   // 'idle' | 'stageActive' | 'stagePaused' | 'stageSpin' | 'stageSpinPaused' | 'tcComplete' | 'battleEnded'
   round: number
   stages: StageDefinition[]
   currentStageIndex: number

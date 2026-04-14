@@ -6,13 +6,14 @@
  * externally in the main process by subscribing to this actor.
  *
  * States:
- *   idle         → waiting for combat to start
- *   stageActive  → a stage is currently running
- *   checkAdvance → transient: decides next stage or TC complete
- *   stagePaused  → a timed stage is paused by GM
- *   stageSpin    → stage completed; hourglass pause before advancing (spinTime > 0)
- *   tcComplete   → all stages done; waiting for GM to start next round
- *   battleEnded  → GM explicitly ended the battle out-of-band
+ *   idle            → waiting for combat to start
+ *   stageActive     → a stage is currently running
+ *   checkAdvance    → transient: decides next stage or TC complete
+ *   stagePaused     → a stage is paused by GM (resumes to stageActive)
+ *   stageSpin       → stage completed; hourglass pause before advancing (spinTime > 0)
+ *   stageSpinPaused → spin is paused by GM (resumes to stageSpin)
+ *   tcComplete      → all stages done; waiting for GM to start next round
+ *   battleEnded     → GM explicitly ended the battle out-of-band
  *
  * Events:
  *   START_COMBAT    → idle → stageActive
@@ -20,17 +21,23 @@
  *   SPIN_TICK       → decrements spin timer in stageSpin
  *   SPIN_COMPLETE   → background ops finished; advance if spin timer also done
  *   SPIN_EXCEPTION  → background ops failed; advance immediately (GM alerted externally)
- *   GM_RELEASE      → advances gm-release stages; ends spin early if ops complete
- *   PASS            → advances any stage with canPass:true
- *   PAUSE           → pauses timed stage
- *   RESUME          → resumes paused stage
+ *   GM_RELEASE      → ends stage early (partial beats consumed); ends spin early if ops complete
+ *   PASS            → skips stage entirely (zero beats consumed); any stage with canPass:true
+ *   PAUSE           → pauses any non-gm-release stage (stageActive or stageSpin)
+ *   RESUME          → resumes from stagePaused or stageSpinPaused
  *   NEXT_ROUND      → tcComplete → stageActive (round increments, new filtered stages)
  *   END_BATTLE      → any active state → battleEnded
  *   RESET           → any state → idle (full reset)
+ *
+ * Beat semantics:
+ *   GM Release (early end) — beats consumed proportionally to elapsed timer time
+ *   GM Pass    (skip)      — zero beats consumed; beatsRemaining restored to stage-entry value
+ *   Natural expiry         — full stage beats consumed
  */
 
 import { createMachine, assign } from 'xstate'
 import type { StageDefinition } from '../../shared/types'
+import { isTimedStageType } from '../../shared/types'
 
 export interface TCContext {
   round: number
@@ -40,6 +47,7 @@ export interface TCContext {
   spinSecondsRemaining: number
   backgroundOpsComplete: boolean   // true when stage background operations are done
   beatsRemaining: number
+  beatsAtStageEntry: number        // beatsRemaining captured when the current stage was entered
   totalBeats: number               // beatsPerTC from the plugin (e.g. 72)
 }
 
@@ -65,11 +73,12 @@ const RESET_CONTEXT: Partial<TCContext> = {
   spinSecondsRemaining: 0,
   backgroundOpsComplete: true,
   beatsRemaining: 0,
+  beatsAtStageEntry: 0,
   totalBeats: 0,
 }
 
 function getTimerSeconds(stage: StageDefinition): number {
-  return stage.type === 'timed' && stage.timerSeconds ? stage.timerSeconds : 0
+  return isTimedStageType(stage.type) && stage.timerSeconds ? stage.timerSeconds : 0
 }
 
 function getSpinTime(stage: StageDefinition): number {
@@ -77,44 +86,41 @@ function getSpinTime(stage: StageDefinition): number {
 }
 
 /**
- * Computes beats remaining in the full TC.
- * totalBeats = beatsPerTC (e.g. 72)
- * Tracks consumption from completed stages + fraction of current timed stage.
+ * Returns true for system-computation stages that auto-advance to spin on entering stageActive.
+ * All non-timed, non-gm-release stages qualify — including passable ones.
+ * canPass on a system stage means the GM can end the spin early, not that the stage skips spin.
+ */
+function isAutoAdvanceSystemStage(stage: StageDefinition): boolean {
+  return !isTimedStageType(stage.type) && stage.type !== 'gm-release'
+}
+
+/**
+ * Computes live beats remaining during a timed stage.
+ * Uses beatsAtStageEntry as the base so partial consumption from prior GM Releases is preserved.
  */
 function computeBeatsRemaining(
-  stages: StageDefinition[],
-  currentStageIndex: number,
-  timerSecondsRemaining: number,
-  totalBeats: number
+  beatsAtStageEntry: number,
+  stage: StageDefinition,
+  timerSecondsRemaining: number
 ): number {
-  const completedBeats = stages
-    .slice(0, currentStageIndex)
-    .reduce((sum, s) => sum + s.beats, 0)
-
-  const currentStage = stages[currentStageIndex]
-  let currentConsumed = 0
-  if (currentStage?.type === 'timed' && currentStage.timerSeconds) {
-    const elapsed = currentStage.timerSeconds - timerSecondsRemaining
-    currentConsumed = (elapsed / currentStage.timerSeconds) * currentStage.beats
-  }
-
-  return Math.max(0, totalBeats - completedBeats - currentConsumed)
+  if (!isTimedStageType(stage.type) || !stage.timerSeconds) return beatsAtStageEntry
+  const elapsed = stage.timerSeconds - timerSecondsRemaining
+  const consumed = (elapsed / stage.timerSeconds) * stage.beats
+  return Math.max(0, beatsAtStageEntry - consumed)
 }
 
 /**
- * Computes beats remaining after the current stage has fully completed.
+ * Computes beats remaining after the current stage has fully and naturally completed.
+ * Uses beatsAtStageEntry as the base — preserves partial consumption from earlier stages.
  */
 function beatsAfterStageComplete(context: TCContext): number {
-  const completedBeats = context.stages
-    .slice(0, context.currentStageIndex + 1)
-    .reduce((sum, s) => sum + s.beats, 0)
-  return Math.max(0, context.totalBeats - completedBeats)
+  const stage = context.stages[context.currentStageIndex]
+  return Math.max(0, context.beatsAtStageEntry - (stage?.beats ?? 0))
 }
 
 /**
- * Assigns context for entering stageSpin from the current stage.
- * Freezes beats at stage-complete value. Spin timer defaults to backgroundOpsComplete=true
- * since no real background ops exist yet — the spin is purely a timed pause.
+ * Assigns context for entering stageSpin from the current stage (natural or auto-advance).
+ * Charges full stage beats (timer ran to completion or stage had 0 beats).
  */
 function spinEntryAssign(context: TCContext): Partial<TCContext> {
   const stage = context.stages[context.currentStageIndex]
@@ -123,6 +129,34 @@ function spinEntryAssign(context: TCContext): Partial<TCContext> {
     spinSecondsRemaining: getSpinTime(stage),
     backgroundOpsComplete: true,
     beatsRemaining: beatsAfterStageComplete(context),
+  }
+}
+
+/**
+ * Assigns context for entering stageSpin via GM Release (early end).
+ * Preserves current live beatsRemaining (partial consumption for timed stages).
+ */
+function spinEntryAssignRelease(context: TCContext): Partial<TCContext> {
+  const stage = context.stages[context.currentStageIndex]
+  return {
+    timerSecondsRemaining: 0,
+    spinSecondsRemaining: getSpinTime(stage),
+    backgroundOpsComplete: true,
+    beatsRemaining: context.beatsRemaining,  // partial beats for timed; unchanged for 0-beat stages
+  }
+}
+
+/**
+ * Assigns context for entering stageSpin via GM Pass (skip).
+ * Restores beatsRemaining to stage-entry value — zero beats consumed.
+ */
+function spinEntryAssignPass(context: TCContext): Partial<TCContext> {
+  const stage = context.stages[context.currentStageIndex]
+  return {
+    timerSecondsRemaining: 0,
+    spinSecondsRemaining: getSpinTime(stage),
+    backgroundOpsComplete: true,
+    beatsRemaining: context.beatsAtStageEntry,
   }
 }
 
@@ -138,6 +172,7 @@ export const tcMachine = createMachine({
     spinSecondsRemaining: 0,
     backgroundOpsComplete: true,
     beatsRemaining: 0,
+    beatsAtStageEntry: 0,
     totalBeats: 0,
   },
 
@@ -154,6 +189,7 @@ export const tcMachine = createMachine({
             spinSecondsRemaining: 0,
             backgroundOpsComplete: true,
             beatsRemaining: event.beatsPerTC,
+            beatsAtStageEntry: event.beatsPerTC,
             totalBeats: event.beatsPerTC,
           })),
         },
@@ -161,13 +197,33 @@ export const tcMachine = createMachine({
     },
 
     stageActive: {
+      // Auto-advance: non-passable system stages enter spin immediately (no timer, no manual trigger).
+      // onEnter hook fires before this resolves; spin represents the background computation window.
+      always: [
+        {
+          guard: ({ context }) => {
+            const stage = context.stages[context.currentStageIndex]
+            return !!stage && isAutoAdvanceSystemStage(stage) && getSpinTime(stage) > 0
+          },
+          actions: assign(({ context }) => spinEntryAssign(context)),
+          target: 'stageSpin',
+        },
+        {
+          guard: ({ context }) => {
+            const stage = context.stages[context.currentStageIndex]
+            return !!stage && isAutoAdvanceSystemStage(stage) && getSpinTime(stage) === 0
+          },
+          target: 'checkAdvance',
+        },
+      ],
+
       on: {
         TICK: [
           {
             // Timed stage — timer expired — has spin
             guard: ({ context }) => {
               const stage = context.stages[context.currentStageIndex]
-              return !!stage && stage.type === 'timed' &&
+              return !!stage && isTimedStageType(stage.type) &&
                 context.timerSecondsRemaining <= 1 && getSpinTime(stage) > 0
             },
             actions: assign(({ context }) => spinEntryAssign(context)),
@@ -177,7 +233,7 @@ export const tcMachine = createMachine({
             // Timed stage — timer expired — no spin
             guard: ({ context }) => {
               const stage = context.stages[context.currentStageIndex]
-              return !!stage && stage.type === 'timed' &&
+              return !!stage && isTimedStageType(stage.type) &&
                 context.timerSecondsRemaining <= 1 && getSpinTime(stage) === 0
             },
             actions: assign(({ context }) => ({
@@ -190,67 +246,75 @@ export const tcMachine = createMachine({
             // Timed stage — still running: decrement
             guard: ({ context }) => {
               const stage = context.stages[context.currentStageIndex]
-              return !!stage && stage.type === 'timed' && context.timerSecondsRemaining > 1
+              return !!stage && isTimedStageType(stage.type) && context.timerSecondsRemaining > 1
             },
             actions: assign(({ context }) => {
+              const stage = context.stages[context.currentStageIndex]
               const newTimer = context.timerSecondsRemaining - 1
               return {
                 timerSecondsRemaining: newTimer,
                 beatsRemaining: computeBeatsRemaining(
-                  context.stages,
-                  context.currentStageIndex,
+                  context.beatsAtStageEntry,
+                  stage,
                   newTimer,
-                  context.totalBeats
                 ),
               }
             }),
           },
         ],
 
+        // GM Release: ends stage early. Beats consumed = elapsed timer proportion (partial for timed;
+        // unchanged for 0-beat stages). Applies to gm-release type AND timed-like stages.
         GM_RELEASE: [
           {
-            // GM-release stage — has spin
             guard: ({ context }) => {
               const stage = context.stages[context.currentStageIndex]
-              return !!stage && stage.type === 'gm-release' && getSpinTime(stage) > 0
+              return !!stage && (stage.type === 'gm-release' || isTimedStageType(stage.type)) &&
+                getSpinTime(stage) > 0
             },
-            actions: assign(({ context }) => spinEntryAssign(context)),
+            actions: assign(({ context }) => spinEntryAssignRelease(context)),
             target: 'stageSpin',
           },
           {
-            // GM-release stage — no spin
             guard: ({ context }) => {
               const stage = context.stages[context.currentStageIndex]
-              return !!stage && stage.type === 'gm-release'
+              return !!stage && (stage.type === 'gm-release' || isTimedStageType(stage.type))
             },
+            actions: assign(({ context }) => ({
+              timerSecondsRemaining: 0,
+              beatsRemaining: context.beatsRemaining,
+            })),
             target: 'checkAdvance',
           },
         ],
 
+        // GM Pass: skips stage entirely. Zero beats consumed — beatsRemaining restored to entry value.
         PASS: [
           {
-            // Passable stage — has spin
             guard: ({ context }) => {
               const stage = context.stages[context.currentStageIndex]
               return !!stage && stage.canPass === true && getSpinTime(stage) > 0
             },
-            actions: assign(({ context }) => spinEntryAssign(context)),
+            actions: assign(({ context }) => spinEntryAssignPass(context)),
             target: 'stageSpin',
           },
           {
-            // Passable stage — no spin
             guard: ({ context }) => {
               const stage = context.stages[context.currentStageIndex]
               return !!stage && stage.canPass === true
             },
+            actions: assign(({ context }) => ({
+              beatsRemaining: context.beatsAtStageEntry,
+            })),
             target: 'checkAdvance',
           },
         ],
 
+        // Pause allowed for all stages except gm-release type.
         PAUSE: {
           guard: ({ context }) => {
             const stage = context.stages[context.currentStageIndex]
-            return !!stage && stage.type === 'timed'
+            return !!stage && stage.type !== 'gm-release'
           },
           target: 'stagePaused',
         },
@@ -260,7 +324,10 @@ export const tcMachine = createMachine({
       },
     },
 
-    // Transient: immediately decides whether to advance to next stage or end TC
+    // Transient: immediately decides whether to advance to next stage or end TC.
+    // beatsRemaining is NOT recomputed here — it is already correct from the previous stage's
+    // exit assignment (natural expiry → full beats charged; GM Release → partial; GM Pass → zero).
+    // Recomputing from stage.beats would overwrite partial consumption with the full stage total.
     checkAdvance: {
       always: [
         {
@@ -269,25 +336,16 @@ export const tcMachine = createMachine({
           actions: assign(({ context }) => {
             const nextIndex = context.currentStageIndex + 1
             const nextStage = context.stages[nextIndex]
-            const timerSeconds = getTimerSeconds(nextStage)
             return {
               currentStageIndex: nextIndex,
-              timerSecondsRemaining: timerSeconds,
+              timerSecondsRemaining: getTimerSeconds(nextStage),
               spinSecondsRemaining: 0,
-              beatsRemaining: computeBeatsRemaining(
-                context.stages, nextIndex, timerSeconds, context.totalBeats
-              ),
+              beatsAtStageEntry: context.beatsRemaining,
             }
           }),
         },
         {
           target: 'tcComplete',
-          actions: assign(({ context }) => ({
-            beatsRemaining: Math.max(
-              0,
-              context.totalBeats - context.stages.reduce((s, st) => s + st.beats, 0)
-            ),
-          })),
         },
       ],
     },
@@ -298,6 +356,7 @@ export const tcMachine = createMachine({
      * Advances when: spin timer reaches 0 AND backgroundOpsComplete is true.
      * GM Release ends spin early if backgroundOpsComplete is true.
      * SPIN_EXCEPTION ends spin immediately (GM is alerted externally).
+     * GM can pause spin (→ stageSpinPaused); all non-gm-release stages support this.
      */
     stageSpin: {
       on: {
@@ -343,6 +402,20 @@ export const tcMachine = createMachine({
           target: 'checkAdvance',
         },
 
+        PAUSE: { target: 'stageSpinPaused' },
+
+        END_BATTLE: { target: 'battleEnded' },
+        RESET:      { target: 'idle', actions: assign(RESET_CONTEXT) },
+      },
+    },
+
+    /**
+     * Spin-paused state: spin timer is frozen. Resumes back into stageSpin.
+     * The spin ticker (external interval) stops when this state is active.
+     */
+    stageSpinPaused: {
+      on: {
+        RESUME:     { target: 'stageSpin' },
         END_BATTLE: { target: 'battleEnded' },
         RESET:      { target: 'idle', actions: assign(RESET_CONTEXT) },
       },
@@ -368,6 +441,7 @@ export const tcMachine = createMachine({
             spinSecondsRemaining: 0,
             backgroundOpsComplete: true,
             beatsRemaining: context.totalBeats,
+            beatsAtStageEntry: context.totalBeats,
           })),
         },
         END_BATTLE: { target: 'battleEnded' },

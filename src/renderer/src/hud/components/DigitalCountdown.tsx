@@ -3,6 +3,10 @@ import { Stack, Text, Box } from '@mantine/core'
 import { IconUser, IconSettings, IconPlayerPause, IconFlagCheck, IconHourglass } from '@tabler/icons-react'
 import type { TCStatePayload } from '@shared/types'
 
+function isTimedType(type: string): boolean {
+  return type === 'timed' || type === 'action' || type === 'response'
+}
+
 interface DigitalCountdownProps {
   state: TCStatePayload
 }
@@ -21,6 +25,18 @@ export function DigitalCountdown({ state }: DigitalCountdownProps): JSX.Element 
         <IconHourglass size={32} color="var(--tm-accent)" />
         <Text size="xs" c="dimmed" tt="uppercase" fw={600} style={{ letterSpacing: '0.08em' }}>
           Processing
+        </Text>
+      </Stack>
+    )
+  }
+
+  // Spin paused
+  if (state.machineState === 'stageSpinPaused') {
+    return (
+      <Stack gap={6} align="center">
+        <IconHourglass size={32} color="var(--tm-warning)" style={{ opacity: 0.7 }} />
+        <Text size="xs" c="var(--tm-warning)" tt="uppercase" fw={600} style={{ letterSpacing: '0.08em', opacity: 0.7 }}>
+          Paused
         </Text>
       </Stack>
     )
@@ -66,8 +82,8 @@ export function DigitalCountdown({ state }: DigitalCountdownProps): JSX.Element 
     )
   }
 
-  // System-complete stage
-  if (stage?.type === 'system-complete') {
+  // Any system-computation stage (no timer) — show hourglass while active
+  if (stage && !isTimedType(stage.type)) {
     return (
       <Stack gap={6} align="center">
         <IconSettings size={32} color="var(--tm-accent)" />

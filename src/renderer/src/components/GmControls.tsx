@@ -14,28 +14,38 @@ export function GmControls(): JSX.Element {
     return () => window.api.offStateUpdate()
   }, [])
 
-  const machineState  = tc?.machineState ?? 'idle'
-  const isIdle        = machineState === 'idle'
-  const isActive      = machineState === 'stageActive'
-  const isPaused      = machineState === 'stagePaused'
-  const isSpin        = machineState === 'stageSpin'
-  const isComplete    = machineState === 'tcComplete'
-  const isBattleEnded = machineState === 'battleEnded'
+  const machineState   = tc?.machineState ?? 'idle'
+  const isIdle         = machineState === 'idle'
+  const isActive       = machineState === 'stageActive'
+  const isPaused       = machineState === 'stagePaused'
+  const isSpin         = machineState === 'stageSpin'
+  const isSpinPaused   = machineState === 'stageSpinPaused'
+  const isComplete     = machineState === 'tcComplete'
+  const isBattleEnded  = machineState === 'battleEnded'
 
-  const currentStage  = tc?.stages[tc.currentStageIndex ?? 0]
-  const inCombat      = !isIdle
-  const canRelease    = (isActive && currentStage?.type === 'gm-release') ||
-                        (isSpin && tc?.backgroundOpsComplete === true)
-  const showRelease   = inCombat && !isComplete && !isBattleEnded
-  const canPass       = (isActive || isPaused) && currentStage?.canPass === true
-  const canPause      = isActive && currentStage?.type === 'timed'
-  const canEndBattle  = !isIdle && !isBattleEnded
-  const canReset      = true
+  const currentStage   = tc?.stages[tc.currentStageIndex ?? 0]
+  const inCombat       = !isIdle
+
+  // GM Release: ends stage early (partial beats consumed).
+  // Enabled on gm-release type stages, timed-like stages (have timerSeconds), and during spin when ops complete.
+  const canRelease     = (isActive && (currentStage?.type === 'gm-release' || (currentStage?.timerSeconds ?? 0) > 0)) ||
+                         (isSpin && tc?.backgroundOpsComplete === true)
+  const showRelease    = inCombat && !isComplete && !isBattleEnded
+
+  // GM Pass: skips stage, zero beats consumed.
+  const canPass        = (isActive || isPaused) && currentStage?.canPass === true
+
+  // Pause: allowed for all non-gm-release stages (stageActive or stageSpin)
+  const canPause       = (isActive && currentStage?.type !== 'gm-release') || isSpin
+  const canResume      = isPaused || isSpinPaused
+
+  const canEndBattle   = !isIdle && !isBattleEnded
+  const canReset       = true
 
   function statusColor(): string {
-    if (isComplete) return 'yellow'
-    if (isPaused)   return 'orange'
-    if (isActive)   return 'green'
+    if (isComplete)              return 'yellow'
+    if (isPaused || isSpinPaused) return 'orange'
+    if (isActive || isSpin)      return 'green'
     return 'gray'
   }
 
@@ -61,9 +71,14 @@ export function GmControls(): JSX.Element {
           )}
         </Group>
 
-        {isActive && currentStage?.type === 'timed' && (
+        {isActive && (tc?.timerSecondsRemaining ?? 0) > 0 && (
           <Text size="xs" c="var(--tm-accent)" mt={4}>
             ⏱ {tc!.timerSecondsRemaining}s remaining
+          </Text>
+        )}
+        {(isSpin || isSpinPaused) && (
+          <Text size="xs" c="dimmed" mt={4}>
+            ⌛ spin {tc!.spinSecondsRemaining}s{isSpinPaused ? ' (paused)' : ''}
           </Text>
         )}
       </Paper>
@@ -125,7 +140,7 @@ export function GmControls(): JSX.Element {
           </Button>
         )}
 
-        {isPaused && (
+        {canResume && (
           <Button
             leftSection={<IconPlayerPlay size={16} />}
             color="green"

@@ -9,6 +9,7 @@ import { StageRegistry } from './stages/registry'
 import { filterStagesForRound, validateStagesRoundVisibility } from './stages/roundVisibilityUtils'
 import { logger } from './logger'
 import type { TCStatePayload } from '../shared/types'
+import { isTimedStageType } from '../shared/types'
 
 // ── Singletons ──────────────────────────────────────────────────────────────
 
@@ -130,7 +131,7 @@ tcActor.subscribe((snapshot) => {
   prevStageIndex   = currentStageIndex
 
   // ── Timer management ─────────────────────────────────────────────────────
-  if (state === 'stageActive' && currentStage?.type === 'timed') {
+  if (state === 'stageActive' && currentStage && isTimedStageType(currentStage.type)) {
     startTicker()
   } else {
     stopTicker()
@@ -139,7 +140,7 @@ tcActor.subscribe((snapshot) => {
   if (state === 'stageSpin') {
     startSpinTicker()
   } else {
-    stopSpinTicker()
+    stopSpinTicker()  // also stops when entering stageSpinPaused
   }
 
   // ── Broadcast ────────────────────────────────────────────────────────────

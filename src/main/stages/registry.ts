@@ -13,10 +13,20 @@
  */
 
 import type { StageHandler } from './StageHandler'
-import { GmReleaseHandler } from './gmRelease'
-import { TimedHandler }     from './timed'
+import { GmReleaseHandler }              from './gmRelease'
+import { TimedHandler }                  from './timed'
+import { SurpriseDeterminationHandler }  from './surpriseDetermination'
+import { InitiativeDeterminationHandler } from './initiativeDetermination'
+import { ActionHandler }                 from './action'
+import { ResponseHandler }               from './response'
+import { ResolutionHandler }             from './resolution'
 
 export const StageRegistry: Record<string, StageHandler> = {
-  'gm-release': GmReleaseHandler,
-  'timed':      TimedHandler,
+  'gm-release':               GmReleaseHandler,
+  'timed':                    TimedHandler,
+  'surprise-determination':   SurpriseDeterminationHandler,
+  'initiative-determination': InitiativeDeterminationHandler,
+  'action':                   ActionHandler,
+  'response':                 ResponseHandler,
+  'resolution':               ResolutionHandler,
 }
