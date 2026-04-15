@@ -1,10 +1,59 @@
 import React, { useEffect, useState } from 'react'
-import { Stack, Group, Button, Paper, Text, Badge, Divider, CloseButton } from '@mantine/core'
+import { Stack, Group, Button, Paper, Text, Badge, Divider, CloseButton, Tooltip, Box } from '@mantine/core'
 import {
   IconSwords, IconPlayerPlay, IconPlayerPause, IconPlayerSkipForward,
   IconFlag, IconDeviceTv, IconSkull, IconRotateClockwise, IconClock,
 } from '@tabler/icons-react'
-import type { TCStatePayload } from '@shared/types'
+import type { TCStatePayload, StageDefinition } from '@shared/types'
+
+// ── Tooltip text helpers ─────────────────────────────────────────────────────
+// Each function returns a context-appropriate explanation for its control.
+// Beat-effect differences between GM Release and GM Pass are explicitly called out.
+
+/**
+ * Context-sensitive tooltip for the GM Release button.
+ * The effect of Release changes significantly depending on current machine state:
+ *   stageGMHold  → starts the player countdown (no beats charged yet)
+ *   stageActive  → ends stage early with proportional beat charge
+ *   stageSpin    → ends spin window early (only when ops complete)
+ */
+function releaseTooltip(
+  isGMHold: boolean,
+  isActive: boolean,
+  isSpin: boolean,
+  stage: StageDefinition | undefined,
+  opsComplete: boolean
+): string {
+  if (isGMHold) {
+    return 'Starts the player countdown for this stage.\n\nNo beats are charged yet — the beat clock begins ticking from the moment you release.'
+  }
+  if (isActive) {
+    if (stage?.type === 'gm-release') {
+      return 'Ends this narrative stage and advances. This stage type has no beat cost — releasing has no effect on the beat budget.'
+    }
+    return 'Ends this stage early.\n\nBeats are charged proportionally to elapsed time only. If half the timer ran, half the stage\'s beats are consumed. The unelapsed time is forfeited.'
+  }
+  if (isSpin) {
+    if (opsComplete) return 'Ends the spin window early and advances to the next stage.'
+    return 'Waiting for background processing to finish before the spin window can end.'
+  }
+  return 'Not available in the current state.'
+}
+
+/**
+ * Context-sensitive tooltip for the Pass Stage button.
+ * Pass always consumes zero beats — the budget is restored to where it was
+ * when the stage was entered. This is distinct from GM Release, which charges
+ * proportional beats for any time already elapsed.
+ */
+function passTooltip(isGMHold: boolean): string {
+  if (isGMHold) {
+    return 'Skips this stage before the timer starts.\n\nZero beats consumed — the beat budget is fully restored to its value at stage entry. Nothing is charged.'
+  }
+  return 'Skips the remainder of this stage.\n\nZero beats consumed — the beat budget is restored to its value when this stage began.\n\nUnlike GM Release, no elapsed time is charged against the budget.'
+}
+
+// ── Component ────────────────────────────────────────────────────────────────
 
 export function GmControls(): JSX.Element {
   const [tc, setTc] = useState<TCStatePayload | null>(null)
@@ -55,6 +104,7 @@ export function GmControls(): JSX.Element {
   const canReset       = true
 
   const showGMHoldBanner = isGMHold && !gmHoldDismissed
+  const nextRound        = (tc?.round ?? 0) + 1
 
   // Maps machine state to a status dot color for the Badge.
   // green = something is actively running (player clock, spin window, or GM hold).
@@ -67,6 +117,9 @@ export function GmControls(): JSX.Element {
     if (isActive || isSpin || isGMHold) return 'green'
     return 'gray'
   }
+
+  // Shared tooltip props — consistent delay and style across all controls
+  const tipProps = { multiline: true, w: 260, withArrow: true, openDelay: 350, style: { whiteSpace: 'pre-line' } } as const
 
   return (
     <Stack gap="md">
@@ -138,76 +191,106 @@ export function GmControls(): JSX.Element {
       {/* Primary action buttons */}
       <Group gap="sm" wrap="wrap">
         {isIdle && (
-          <Button
-            leftSection={<IconSwords size={16} />}
-            color="green"
-            onClick={() => window.api.startCombat()}
-          >
-            Start Combat
-          </Button>
+          <Tooltip label="Starts the Tactical Cycle and builds the stage pipeline for round 1." {...tipProps}>
+            <Button
+              leftSection={<IconSwords size={16} />}
+              color="green"
+              onClick={() => window.api.startCombat()}
+            >
+              Start Combat
+            </Button>
+          </Tooltip>
         )}
 
         {inCombat && (
-          <Button
-            leftSection={<IconDeviceTv size={16} />}
-            variant="outline"
-            onClick={() => window.api.launchHUD()}
-          >
-            Launch Group HUD
-          </Button>
+          <Tooltip label="Opens the Group HUD window for display on a second screen." {...tipProps}>
+            <Button
+              leftSection={<IconDeviceTv size={16} />}
+              variant="outline"
+              onClick={() => window.api.launchHUD()}
+            >
+              Launch Group HUD
+            </Button>
+          </Tooltip>
         )}
 
         {showRelease && (
-          <Button
-            leftSection={<IconFlag size={16} />}
-            color="var(--tm-accent)"
-            variant="filled"
-            disabled={!canRelease}
-            onClick={() => window.api.gmRelease()}
+          // Wrap in Box so the tooltip still renders even when the button is disabled
+          <Tooltip
+            label={releaseTooltip(isGMHold, isActive, isSpin, currentStage, tc?.backgroundOpsComplete ?? false)}
+            {...tipProps}
           >
-            GM Release
-          </Button>
+            <Box component="span" style={{ display: 'inline-flex' }}>
+              <Button
+                leftSection={<IconFlag size={16} />}
+                color="var(--tm-accent)"
+                variant="filled"
+                disabled={!canRelease}
+                style={!canRelease ? { pointerEvents: 'none' } : undefined}
+                onClick={() => window.api.gmRelease()}
+              >
+                GM Release
+              </Button>
+            </Box>
+          </Tooltip>
         )}
 
         {canPass && (
-          <Button
-            leftSection={<IconPlayerSkipForward size={16} />}
-            variant="light"
-            onClick={() => window.api.pass()}
-          >
-            Pass Stage
-          </Button>
+          <Tooltip label={passTooltip(isGMHold)} {...tipProps}>
+            <Button
+              leftSection={<IconPlayerSkipForward size={16} />}
+              variant="light"
+              onClick={() => window.api.pass()}
+            >
+              Pass Stage
+            </Button>
+          </Tooltip>
         )}
 
         {canPause && (
-          <Button
-            leftSection={<IconPlayerPause size={16} />}
-            color="orange"
-            variant="light"
-            onClick={() => window.api.pause()}
+          <Tooltip
+            label={isSpin ? 'Freezes the spin countdown.' : 'Freezes the player countdown timer. Beats stop accumulating while paused.'}
+            {...tipProps}
           >
-            Pause
-          </Button>
+            <Button
+              leftSection={<IconPlayerPause size={16} />}
+              color="orange"
+              variant="light"
+              onClick={() => window.api.pause()}
+            >
+              Pause
+            </Button>
+          </Tooltip>
         )}
 
         {canResume && (
-          <Button
-            leftSection={<IconPlayerPlay size={16} />}
-            color="green"
-            onClick={() => window.api.resume()}
+          <Tooltip
+            label={isSpinPaused ? 'Resumes the spin countdown from where it was frozen.' : 'Resumes the player countdown from where it was frozen. Beat accumulation continues.'}
+            {...tipProps}
           >
-            Resume
-          </Button>
+            <Button
+              leftSection={<IconPlayerPlay size={16} />}
+              color="green"
+              onClick={() => window.api.resume()}
+            >
+              Resume
+            </Button>
+          </Tooltip>
         )}
 
         {isComplete && (
-          <Button
-            leftSection={<IconPlayerSkipForward size={16} />}
-            color="blue"
-            onClick={() => window.api.nextRound()}
+          <Tooltip
+            label={`Advances to round ${nextRound}. The beat budget resets to the full ${tc?.totalBeats ?? 72} beats and the stage pipeline is rebuilt for the new round.`}
+            {...tipProps}
           >
-            Next Round
-          </Button>
+            <Button
+              leftSection={<IconPlayerSkipForward size={16} />}
+              color="blue"
+              onClick={() => window.api.nextRound()}
+            >
+              Next Round
+            </Button>
+          </Tooltip>
         )}
       </Group>
 
@@ -217,23 +300,27 @@ export function GmControls(): JSX.Element {
           <Divider color="var(--tm-border)" />
           <Group gap="sm" wrap="wrap">
             {canEndBattle && (
-              <Button
-                leftSection={<IconSkull size={16} />}
-                color="red"
-                variant="light"
-                onClick={() => window.api.endBattle()}
-              >
-                End Battle
-              </Button>
+              <Tooltip label="Ends the battle immediately. All timers stop and the Group HUD shows the end screen." {...tipProps}>
+                <Button
+                  leftSection={<IconSkull size={16} />}
+                  color="red"
+                  variant="light"
+                  onClick={() => window.api.endBattle()}
+                >
+                  End Battle
+                </Button>
+              </Tooltip>
             )}
-            <Button
-              leftSection={<IconRotateClockwise size={16} />}
-              color="gray"
-              variant="subtle"
-              onClick={() => window.api.resetBattle()}
-            >
-              Reset Battle
-            </Button>
+            <Tooltip label="Resets everything to idle — clears all round, stage, and beat state. This cannot be undone." {...tipProps}>
+              <Button
+                leftSection={<IconRotateClockwise size={16} />}
+                color="gray"
+                variant="subtle"
+                onClick={() => window.api.resetBattle()}
+              >
+                Reset Battle
+              </Button>
+            </Tooltip>
           </Group>
         </>
       )}

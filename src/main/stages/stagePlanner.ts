@@ -35,6 +35,11 @@ function isTriadType(type: StageDefinition['type']): boolean {
   return TRIAD_TYPES.has(type)
 }
 
+/** Rounds a beat value to at most 2 decimal places, avoiding floating-point trailing noise. */
+function round2(n: number): number {
+  return Math.round(n * 100) / 100
+}
+
 export class StagePlanner {
   /** Minimum timer (seconds) for any StagePlanner-adjusted stage. Plugin-defined. */
   private readonly minTimerSeconds: number
@@ -298,9 +303,11 @@ export class StagePlanner {
       if (ceilOk)  return { adjAction: ceilA,  adjResponse: ceilR  }
     }
 
-    // Replan path: beatsRemaining is a running float — keep proportional, clamp to constraints
-    const adjA = Math.max(1, Math.min(beatsAvailable - 1, propA))
-    return { adjAction: adjA, adjResponse: beatsAvailable - adjA }
+    // Replan path: beatsRemaining is a running float — keep proportional, clamp to constraints.
+    // round2() prevents floating-point trailing noise (e.g. 8.096000000000001 → 8.1).
+    const adjA = round2(Math.max(1, Math.min(beatsAvailable - 1, propA)))
+    const adjR = round2(beatsAvailable - adjA)
+    return { adjAction: adjA, adjResponse: adjR }
   }
 
   /**
