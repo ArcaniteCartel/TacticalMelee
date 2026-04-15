@@ -37,12 +37,31 @@ export interface StageDefinition {
   description: string                          // message shown in the HUD message area
   roundVisibility: RoundVisibilityEntry[]      // which rounds this stage participates in
   spinTime: number                             // seconds to pause (hourglass) after stage completes before advancing
+  /**
+   * DSL expression string providing a custom StagePlanner calculation sequence.
+   * If set, the StagePlanner uses this expression to determine tier count and beat
+   * allocation instead of the system default arithmetic.
+   * Currently unpopulated — slot reserved for future plugin-driven planning logic.
+   */
+  calculationSequence?: string
+  /**
+   * Zero-based tier index assigned by the StagePlanner to generated triad copies.
+   * Undefined for preamble stages (non-triad stages that precede the Action Tier).
+   * Used by the StagePlanner to identify and adjust the last tier during replan.
+   */
+  tierIndex?: number
 }
 
 export interface PluginConfig {
   pluginName: string
   beatsPerTC: number
   stages: StageDefinition[]
+  /**
+   * Minimum timer (seconds) the StagePlanner may assign when pro-rating an
+   * adjusted Action or Response stage. Prevents a beat-budget adjustment from
+   * producing a meaninglessly short countdown. Defined per plugin.
+   */
+  minAdjustedTimerSeconds: number
 }
 
 /**

@@ -27,6 +27,9 @@ export class ActivePlugin {
     pluginName: 'TacticalMelee Standard',
     // 72 beats represents one full in-world Tactical Cycle (~1 minute of combat time)
     beatsPerTC: 72,
+    // StagePlanner will never pro-rate an Action/Response timer below this value.
+    // 5 s is the practical floor: shorter than this gives players no meaningful decision window.
+    minAdjustedTimerSeconds: 5,
     stages: [
       {
         id: 'gm-narrative',

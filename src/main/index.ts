@@ -6,6 +6,7 @@ import { tcMachine } from './tc/tcMachine'
 import { ActivePlugin } from './plugins/ActivePlugin'
 import { createLanServer, LAN_PORT } from './server/lanServer'
 import { StageRegistry } from './stages/registry'
+import { StagePlanner } from './stages/stagePlanner'
 import { filterStagesForRound, validateStagesRoundVisibility } from './stages/roundVisibilityUtils'
 import { logger } from './logger'
 import type { TCStatePayload } from '../shared/types'
@@ -16,9 +17,13 @@ import { isTimedStageType } from '../shared/types'
 let mainWindow: BrowserWindow | null = null
 let hudWindow:  BrowserWindow | null = null
 
-const activePlugin = new ActivePlugin()
-const tcActor     = createActor(tcMachine)
-const lanServer   = createLanServer()
+const activePlugin  = new ActivePlugin()
+const tcActor       = createActor(tcMachine)
+const lanServer     = createLanServer()
+// StagePlanner expands the Action Tier triad to fill the round's beat budget.
+// Constructed once from the plugin's minimum timer floor so the floor is consistent
+// for the lifetime of the app (plugin config does not change at runtime).
+const stagePlanner  = new StagePlanner(activePlugin.getConfig().minAdjustedTimerSeconds)
 
 let tickInterval:     ReturnType<typeof setInterval> | null = null
 let spinTickInterval: ReturnType<typeof setInterval> | null = null
@@ -132,6 +137,47 @@ tcActor.subscribe((snapshot) => {
     }
   }
 
+  // ── StagePlanner — Resolution-complete detection ─────────────────────────
+  //
+  // Detect when a Resolution stage's spin has just ended (machine left stageSpin
+  // and the previous stage was of type 'resolution'). This is the RESOLUTION_COMPLETE
+  // trigger point: the StagePlanner replans the last tier with actual beatsRemaining,
+  // accounting for drift caused by partial GM Releases or Passes in earlier stages.
+  //
+  // The detection uses prevMachineState (set at end of previous subscription tick)
+  // and prevStageIndex to identify the just-completed stage. checkAdvance is a
+  // skipped transient state, so prevMachineState correctly reflects 'stageSpin'.
+  {
+    const prevStage = stages[prevStageIndex]
+    const resolutionComplete = (
+      prevMachineState === 'stageSpin' &&
+      prevStage?.type === 'resolution' &&
+      state !== 'stageSpin' &&
+      state !== 'stageSpinPaused'
+    )
+
+    if (resolutionComplete) {
+      if (state === 'tcComplete') {
+        // Round ended after the final Resolution. Any beats remaining are residual —
+        // log them for future algorithm analysis; they have no mechanical effect.
+        if (snapshot.context.beatsRemaining > 0.05) {
+          logger.info(
+            { residualBeats: snapshot.context.beatsRemaining, round: snapshot.context.round },
+            'StagePlanner: residual beats discarded at TC end'
+          )
+        }
+      } else {
+        // More tiers remain — replan the last tier's beat allocation with the
+        // actual live beatsRemaining (may differ from the initial projection).
+        const completedTierIndex = prevStage.tierIndex ?? -1
+        if (completedTierIndex >= 0) {
+          const updatedStages = stagePlanner.replan(stages, snapshot.context.beatsRemaining, completedTierIndex)
+          tcActor.send({ type: 'UPDATE_PIPELINE', stages: updatedStages })
+        }
+      }
+    }
+  }
+
   prevMachineState = state
   prevStageIndex   = currentStageIndex
 
@@ -177,12 +223,13 @@ tcActor.start()
 // The renderer sends these via window.api.* (see preload/index.ts).
 // Responses travel back via tc:state-update broadcasts from tcActor.subscribe.
 
-// Filter stages for round 1 and start the machine. beatsPerTC initialises
-// the beat ledger (beatsRemaining = beatsAtStageEntry = beatsPerTC).
+// Filter stages for round 1, expand the pipeline via StagePlanner, then start the machine.
+// beatsPerTC initialises the beat ledger (beatsRemaining = beatsAtStageEntry = beatsPerTC).
 ipcMain.on('tc:start-combat', () => {
   const allStages  = activePlugin.getStages()
   const beatsPerTC = activePlugin.getBeatsPerTC()
-  const stages     = filterStagesForRound(allStages, 1)
+  const filtered   = filterStagesForRound(allStages, 1)
+  const stages     = stagePlanner.plan(filtered, beatsPerTC)
   tcActor.send({ type: 'START_COMBAT', stages, beatsPerTC })
 })
 
@@ -199,10 +246,12 @@ ipcMain.on('tc:pause',      () => tcActor.send({ type: 'PAUSE' }))
 // Resumes from either paused state back to its respective active state.
 ipcMain.on('tc:resume',     () => tcActor.send({ type: 'RESUME' }))
 
-// Increments round, reloads round-filtered stage list, resets beat ledger to totalBeats.
+// Increments round, reloads round-filtered + StagePlanner-expanded stage list,
+// resets beat ledger to totalBeats.
 ipcMain.on('tc:next-round', () => {
   const nextRound = tcActor.getSnapshot().context.round + 1
-  const stages    = filterStagesForRound(activePlugin.getStages(), nextRound)
+  const filtered  = filterStagesForRound(activePlugin.getStages(), nextRound)
+  const stages    = stagePlanner.plan(filtered, activePlugin.getBeatsPerTC())
   tcActor.send({ type: 'NEXT_ROUND', stages })
 })
 

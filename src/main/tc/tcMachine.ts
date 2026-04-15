@@ -26,9 +26,10 @@
  *   PASS            → skips stage entirely (zero beats consumed); any stage with canPass:true
  *   PAUSE           → pauses any non-gm-release stage (stageActive or stageSpin); NOT stageGMHold
  *   RESUME          → resumes from stagePaused or stageSpinPaused
- *   NEXT_ROUND      → tcComplete → stageActive (round increments, new filtered stages)
- *   END_BATTLE      → any active state → battleEnded
- *   RESET           → any state → idle (full reset)
+ *   NEXT_ROUND       → tcComplete → stageActive (round increments, new filtered stages)
+ *   UPDATE_PIPELINE  → any mid-combat state → replaces stages[] with StagePlanner replan output
+ *   END_BATTLE       → any active state → battleEnded
+ *   RESET            → any state → idle (full reset)
  *
  * Beat semantics:
  *   GM Release (early end) — beats consumed proportionally to elapsed timer time
@@ -65,6 +66,13 @@ export type TCEvent =
   | { type: 'NEXT_ROUND'; stages: StageDefinition[] }
   | { type: 'END_BATTLE' }
   | { type: 'RESET' }
+  /**
+   * Sent by the StagePlanner after every Resolution spin completes.
+   * Replaces stages[] in context with a re-adjusted pipeline (last tier beat
+   * allocations recalculated from actual live beatsRemaining). Tier count is
+   * never changed by this event — only the last tier's beats/timers update.
+   */
+  | { type: 'UPDATE_PIPELINE'; stages: StageDefinition[] }
 
 const RESET_CONTEXT: Partial<TCContext> = {
   round: 0,
@@ -329,6 +337,10 @@ export const tcMachine = createMachine({
           target: 'stagePaused',
         },
 
+        // StagePlanner replan: replace pipeline with last-tier-adjusted copy.
+        // Beat math is unaffected — beatsAtStageEntry and beatsRemaining are not touched.
+        UPDATE_PIPELINE: { actions: assign({ stages: ({ event }) => event.stages }) },
+
         END_BATTLE: { target: 'battleEnded' },
         RESET:      { target: 'idle', actions: assign(RESET_CONTEXT) },
       },
@@ -412,6 +424,10 @@ export const tcMachine = createMachine({
           target: 'checkAdvance',
         },
 
+        // StagePlanner replan arriving while in GM hold (most common case).
+        // The timer has not started yet; timerSeconds will be read fresh on GM Release.
+        UPDATE_PIPELINE: { actions: assign({ stages: ({ event }) => event.stages }) },
+
         END_BATTLE: { target: 'battleEnded' },
         RESET:      { target: 'idle', actions: assign(RESET_CONTEXT) },
       },
@@ -471,6 +487,10 @@ export const tcMachine = createMachine({
 
         PAUSE: { target: 'stageSpinPaused' },
 
+        // StagePlanner replan can arrive during spin (e.g. if a prior resolution triggered it
+        // while a subsequent resolution is still in its spin window — edge case).
+        UPDATE_PIPELINE: { actions: assign({ stages: ({ event }) => event.stages }) },
+
         END_BATTLE: { target: 'battleEnded' },
         RESET:      { target: 'idle', actions: assign(RESET_CONTEXT) },
       },
@@ -482,17 +502,19 @@ export const tcMachine = createMachine({
      */
     stageSpinPaused: {
       on: {
-        RESUME:     { target: 'stageSpin' },
-        END_BATTLE: { target: 'battleEnded' },
-        RESET:      { target: 'idle', actions: assign(RESET_CONTEXT) },
+        RESUME:          { target: 'stageSpin' },
+        UPDATE_PIPELINE: { actions: assign({ stages: ({ event }) => event.stages }) },
+        END_BATTLE:      { target: 'battleEnded' },
+        RESET:           { target: 'idle', actions: assign(RESET_CONTEXT) },
       },
     },
 
     stagePaused: {
       on: {
-        RESUME:     { target: 'stageActive' },
-        END_BATTLE: { target: 'battleEnded' },
-        RESET:      { target: 'idle', actions: assign(RESET_CONTEXT) },
+        RESUME:          { target: 'stageActive' },
+        UPDATE_PIPELINE: { actions: assign({ stages: ({ event }) => event.stages }) },
+        END_BATTLE:      { target: 'battleEnded' },
+        RESET:           { target: 'idle', actions: assign(RESET_CONTEXT) },
       },
     },
 
