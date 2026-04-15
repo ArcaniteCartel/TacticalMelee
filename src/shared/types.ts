@@ -45,19 +45,32 @@ export interface PluginConfig {
   stages: StageDefinition[]
 }
 
-// The state payload broadcast to all clients on every TC state change.
+/**
+ * State payload broadcast to all clients (renderer and HUD) on every TC state change.
+ * Sent via IPC (tc:state-update) to the GM Dashboard and via WebSocket to the Group HUD.
+ */
 export interface TCStatePayload {
-  machineState: string   // 'idle' | 'stageGMHold' | 'stageActive' | 'stagePaused' | 'stageSpin' | 'stageSpinPaused' | 'tcComplete' | 'battleEnded'
+  /** Current XState machine state: 'idle' | 'stageGMHold' | 'stageActive' | 'stagePaused' | 'stageSpin' | 'stageSpinPaused' | 'tcComplete' | 'battleEnded' */
+  machineState: string
+  /** Current round number. 0 when idle (combat not yet started). */
   round: number
+  /** The filtered stage list for the current round (excludes stages inactive for this round). */
   stages: StageDefinition[]
+  /** Index into stages[] pointing at the currently active stage. */
   currentStageIndex: number
+  /** Seconds remaining on the active stage's player countdown. 0 when not a timed stage or in stageGMHold. */
   timerSecondsRemaining: number
+  /** Seconds remaining in the post-stage spin window. 0 outside of stageSpin/stageSpinPaused. */
   spinSecondsRemaining: number
+  /** True when the current stage's background computation has finished. Gates GM Release during stageSpin. */
   backgroundOpsComplete: boolean
+  /** Live beat ledger: beats remaining in the current TC. Updated every TICK during timed stages. */
   beatsRemaining: number
+  /** Total beats in one TC (beatsPerTC from the plugin, e.g. 72). Used to compute the burndown fraction. */
   totalBeats: number
 }
 
+/** WebSocket message envelope used by the LAN server to broadcast TC state to connected HUD clients. */
 export interface WSMessage {
   type: 'TC_STATE'
   payload: TCStatePayload

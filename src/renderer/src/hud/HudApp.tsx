@@ -7,6 +7,8 @@ import { StageList }        from './components/StageList'
 import { DigitalCountdown } from './components/DigitalCountdown'
 import { BeatsBurndown }    from './components/BeatsBurndown'
 
+// Derive the WebSocket URL from the page's own hostname so the HUD automatically
+// connects to the host that served it — both locally and over LAN.
 const WS_URL = `ws://${window.location.hostname}:3001`
 
 export function HudApp(): JSX.Element {
@@ -33,9 +35,12 @@ export function HudApp(): JSX.Element {
 
       ws.onclose = () => {
         setConnected(false)
+        // Retry after 2 s. The pending timer is cleared in the cleanup function
+        // so a component unmount does not fire a reconnect after teardown.
         reconnectTimer = setTimeout(connect, 2000)
       }
 
+      // Force close on error so onclose always fires and drives the reconnect loop.
       ws.onerror = () => ws.close()
     }
 
@@ -80,6 +85,10 @@ export function HudApp(): JSX.Element {
     )
   }
 
+  // CSS grid layout: 2 rows × 4 columns.
+  // Row 1 (auto height): round counter | message area (spans 3 cols).
+  // Row 2 (fills remaining): stage list | combat content (future) | countdown | beats burndown.
+  // gap:'1px' renders as thin divider lines between cells using the body background bleed.
   return (
     <Box
       style={{

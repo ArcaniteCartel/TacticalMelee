@@ -15,6 +15,8 @@ export function GmControls(): JSX.Element {
     return () => window.api.offStateUpdate()
   }, [])
 
+  // Flatten tc state into named booleans for readability throughout the render.
+  // Defaults to 'idle' when no state has been received yet (tc is null on first render).
   const machineState   = tc?.machineState ?? 'idle'
   const isIdle         = machineState === 'idle'
   const isGMHold       = machineState === 'stageGMHold'
@@ -54,6 +56,11 @@ export function GmControls(): JSX.Element {
 
   const showGMHoldBanner = isGMHold && !gmHoldDismissed
 
+  // Maps machine state to a status dot color for the Badge.
+  // green = something is actively running (player clock, spin window, or GM hold).
+  // orange = paused (either the player clock or the spin window).
+  // yellow = TC finished, awaiting Next Round.
+  // gray = idle or ended — nothing running.
   function statusColor(): string {
     if (isComplete)               return 'yellow'
     if (isPaused || isSpinPaused) return 'orange'

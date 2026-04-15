@@ -7,6 +7,12 @@ interface MessageAreaProps {
   state: TCStatePayload
 }
 
+/**
+ * Returns the contextual icon for the current machine state and stage type.
+ * Machine-state checks take priority over stage-type checks so that transient
+ * states like stageGMHold and stagePaused always show the correct icon regardless
+ * of what stage type is active underneath.
+ */
 function getIcon(state: TCStatePayload): JSX.Element | null {
   const stage = state.stages[state.currentStageIndex]
   if (!stage) return null
@@ -26,6 +32,11 @@ function getIcon(state: TCStatePayload): JSX.Element | null {
   return null
 }
 
+/**
+ * Returns the message string to display in the HUD message area.
+ * Priority: machine-state overrides (tcComplete, paused, stageGMHold) → stage description fallback.
+ * The stage description is the authoritative message for all normal running states.
+ */
 function getMessage(state: TCStatePayload): string {
   if (state.machineState === 'tcComplete') return 'Round complete. Awaiting GM.'
   if (state.machineState === 'stagePaused') return 'Combat paused.'

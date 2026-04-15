@@ -8,9 +8,15 @@ interface BeatsBurndownProps {
 }
 
 export function BeatsBurndown({ beatsRemaining, totalBeats, machineState }: BeatsBurndownProps): JSX.Element {
+  // Clamp to [0, 1] to guard against momentary over/under values during live ticks.
   const fraction = totalBeats > 0 ? Math.min(1, Math.max(0, beatsRemaining / totalBeats)) : 1
   const isPaused = machineState === 'stagePaused'
 
+  // Three-threshold color ramp mirroring the countdown timer:
+  //   > 50%  → active (green)       — plenty of time budget remaining
+  //   > 20%  → warning (yellow)     — entering the last quarter of the TC
+  //   > 0%   → critical (red)       — nearly exhausted; GM should wrap up fast
+  //   = 0%   → border color         — depleted; no beats left
   const barColor =
     fraction > 0.5
       ? 'var(--tm-timer-active)'
@@ -22,8 +28,9 @@ export function BeatsBurndown({ beatsRemaining, totalBeats, machineState }: Beat
 
   const BAR_HEIGHT = 320
 
-  // Marker sits at the top of the remaining fill (i.e. the consumed/remaining boundary)
-  // fraction=1 → marker at top (0% from top); fraction=0 → marker at bottom (100% from top)
+  // Convert fraction to a CSS top% for the marker line.
+  // The fill grows from the bottom, so the consumed/remaining boundary is at (1 - fraction) from the top.
+  // fraction=1 (full) → 0% from top (marker at very top); fraction=0 (empty) → 100% from top (marker at bottom).
   const markerTopPct = (1 - fraction) * 100
   const beatsConsumed = totalBeats > 0 ? totalBeats - beatsRemaining : 0
 

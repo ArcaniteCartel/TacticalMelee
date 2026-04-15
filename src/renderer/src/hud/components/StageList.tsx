@@ -9,6 +9,10 @@ interface StageListProps {
   machineState: string
 }
 
+// Icon map for stage types shown on upcoming/active stages.
+// 'action' and 'response' intentionally fall through to the empty fragment —
+// they are timed types but visually distinct; icons will be added when art is finalised.
+// 'system-complete' is a legacy alias kept for backwards compatibility with old plugin configs.
 function stageTypeIcon(type: StageDefinition['type'], size = 14): JSX.Element {
   if (type === 'gm-release')     return <IconUser size={size} />
   if (type === 'timed')          return <IconClock size={size} />
@@ -26,6 +30,10 @@ export function StageList({ stages, currentIndex, machineState }: StageListProps
       </Text>
 
       {stages.map((stage, idx) => {
+        // Three mutually exclusive visual states for each stage card:
+        // isDone     — stage has already been processed this round (or the whole TC is complete)
+        // isActive   — the stage the machine is currently in
+        // isUpcoming — not yet reached; rendered at reduced opacity to de-emphasise
         const isDone    = idx < currentIndex || isComplete
         const isActive  = idx === currentIndex && !isComplete
         const isUpcoming = idx > currentIndex && !isComplete

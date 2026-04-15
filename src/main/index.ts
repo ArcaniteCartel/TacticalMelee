@@ -42,7 +42,8 @@ function stopSpinTicker(): void {
 }
 
 // ── Dev log bridge ───────────────────────────────────────────────────────────
-// Forwards main-process log lines to the renderer DevTools console (dev only).
+// Forwards stage hook log lines to the renderer DevTools console (dev only).
+// Eliminates the need to watch both the terminal and DevTools during development.
 function devLog(message: string): void {
   if (is.dev) {
     mainWindow?.webContents.send('tm:dev-log', message)
@@ -50,7 +51,9 @@ function devLog(message: string): void {
 }
 
 // ── GM Alert ────────────────────────────────────────────────────────────────
-// Surfaces critical errors to the GM's console UI and the log.
+// Surfaces critical errors to the GM's console UI, the pino log, and stderr.
+// Used for plugin configuration errors detected at startup (e.g. a stage that
+// is always inactive). The renderer shows these as a dismissable red banner.
 function gmAlert(message: string): void {
   mainWindow?.webContents.send('tm:gm-alert', message)
   logger.error({ alert: message }, 'GM Alert')
@@ -170,7 +173,12 @@ tcActor.subscribe((snapshot) => {
 tcActor.start()
 
 // ── IPC handlers ────────────────────────────────────────────────────────────
+// All handlers are fire-and-forget (one-way from renderer to main).
+// The renderer sends these via window.api.* (see preload/index.ts).
+// Responses travel back via tc:state-update broadcasts from tcActor.subscribe.
 
+// Filter stages for round 1 and start the machine. beatsPerTC initialises
+// the beat ledger (beatsRemaining = beatsAtStageEntry = beatsPerTC).
 ipcMain.on('tc:start-combat', () => {
   const allStages  = activePlugin.getStages()
   const beatsPerTC = activePlugin.getBeatsPerTC()
@@ -178,18 +186,34 @@ ipcMain.on('tc:start-combat', () => {
   tcActor.send({ type: 'START_COMBAT', stages, beatsPerTC })
 })
 
+// In stageGMHold: starts the player countdown. In stageActive: ends stage early (partial beats).
+// In stageSpin: ends spin early (only when backgroundOpsComplete is true).
 ipcMain.on('tc:gm-release', () => tcActor.send({ type: 'GM_RELEASE' }))
+
+// Skips the current stage — zero beats consumed, beatsRemaining restored to stage-entry value.
 ipcMain.on('tc:pass',       () => tcActor.send({ type: 'PASS' }))
+
+// Freezes the active timer (stageActive → stagePaused, stageSpin → stageSpinPaused).
 ipcMain.on('tc:pause',      () => tcActor.send({ type: 'PAUSE' }))
+
+// Resumes from either paused state back to its respective active state.
 ipcMain.on('tc:resume',     () => tcActor.send({ type: 'RESUME' }))
+
+// Increments round, reloads round-filtered stage list, resets beat ledger to totalBeats.
 ipcMain.on('tc:next-round', () => {
   const nextRound = tcActor.getSnapshot().context.round + 1
   const stages    = filterStagesForRound(activePlugin.getStages(), nextRound)
   tcActor.send({ type: 'NEXT_ROUND', stages })
 })
+
+// Transitions to battleEnded — all timers stop, HUD shows end screen.
 ipcMain.on('tc:end-battle', () => tcActor.send({ type: 'END_BATTLE' }))
+
+// Full reset to idle — clears all context including round, stages, and beat ledger.
 ipcMain.on('tc:reset',      () => tcActor.send({ type: 'RESET' }))
 
+// Opens the Group HUD window (1920×1080, no preload — read-only WebSocket client).
+// If already open, focuses it rather than creating a second instance.
 ipcMain.on('tc:launch-hud', () => {
   if (hudWindow) {
     hudWindow.focus()
@@ -204,6 +228,7 @@ ipcMain.on('tc:launch-hud', () => {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      // No preload: the HUD connects via WebSocket (port 3001), not IPC.
     },
   })
 
@@ -220,6 +245,7 @@ ipcMain.on('tc:launch-hud', () => {
 
 // ── Window creation ─────────────────────────────────────────────────────────
 
+/** Creates the GM Dashboard window. Hidden until ready-to-show to avoid a white flash. */
 function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -252,6 +278,9 @@ function createWindow(): void {
 app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.tacticalmelee.app')
 
+  // Content Security Policy injected on every response.
+  // Dev relaxes script-src (unsafe-inline/eval for Vite HMR) and connect-src
+  // (ws/http localhost for the dev server and LAN WebSocket).
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     const csp = is.dev
       ? `default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://localhost:* http://localhost:*; img-src 'self' data:; font-src 'self' data:`

@@ -7,10 +7,14 @@ import { GmControls }    from './components/GmControls'
 
 export default function App(): JSX.Element {
   const [settingsOpen, { open: openSettings, close: closeSettings }] = useDisclosure(false)
+  // gmAlerts is a queue: TopBar shows the first item, dismiss removes it and reveals the next.
+  // Alerts originate from the main process via tm:gm-alert IPC (plugin config errors, etc.).
   const [gmAlerts, setGmAlerts] = useState<string[]>([])
 
   React.useEffect(() => {
+    // Forward main-process dev log lines to DevTools console (no-ops in production).
     window.api.onDevLog((message) => console.log(message))
+    // Append each GM alert to the queue; TopBar handles display and dismissal ordering.
     window.api.onGmAlert((message) => setGmAlerts(prev => [...prev, message]))
   }, [])
 

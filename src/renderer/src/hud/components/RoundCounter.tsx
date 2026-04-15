@@ -7,6 +7,7 @@ interface RoundCounterProps {
 }
 
 export function RoundCounter({ round, machineState }: RoundCounterProps): JSX.Element {
+  // tcComplete highlights the round number in accent color and appends a "Complete" label.
   const isComplete = machineState === 'tcComplete'
 
   return (
@@ -22,6 +23,7 @@ export function RoundCounter({ round, machineState }: RoundCounterProps): JSX.El
           color: isComplete ? 'var(--tm-accent)' : 'var(--mantine-color-text)',
         }}
       >
+        {/* Show '—' before combat starts (round 0 = idle) */}
         {round > 0 ? round : '—'}
       </Text>
       {isComplete && (

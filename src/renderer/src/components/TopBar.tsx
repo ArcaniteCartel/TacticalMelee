@@ -9,6 +9,8 @@ interface TopBarProps {
 }
 
 export function TopBar({ onSettingsOpen, gmAlerts, onDismissAlert }: TopBarProps): JSX.Element {
+  // Always display the first queued alert. Dismissing index 0 shifts the queue,
+  // revealing the next alert. A "[N] " count prefix appears when more than one is queued.
   const current = gmAlerts[0] ?? null
 
   return (

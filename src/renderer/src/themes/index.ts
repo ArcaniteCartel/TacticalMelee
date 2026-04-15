@@ -5,6 +5,15 @@ import { ironTheme, ironVarsResolver, ironMeta } from './iron'
 
 export type ThemeName = 'tactical' | 'arcane' | 'iron'
 
+/**
+ * A theme entry bundles three things:
+ *  - theme:       Mantine theme override (colors, typography, etc.)
+ *  - varsResolver: maps Mantine CSS vars → TacticalMelee's --tm-* custom properties
+ *  - meta:        display name, description, and preview swatches for the settings UI
+ *
+ * To add a new theme: create a file in this directory, export these three objects,
+ * import them here, and add a new entry to THEMES. No other files need changing.
+ */
 export interface ThemeEntry {
   theme: MantineThemeOverride
   varsResolver: CSSVariablesResolver

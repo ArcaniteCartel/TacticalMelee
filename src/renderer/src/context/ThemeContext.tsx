@@ -2,6 +2,8 @@ import React, { createContext, useContext, useState } from 'react'
 import { MantineProvider } from '@mantine/core'
 import { THEMES, ThemeName } from '../themes'
 
+// Theme selection is persisted to localStorage so the user's choice survives window reloads.
+// Falls back to 'tactical' if no valid stored value is found.
 const STORAGE_KEY = 'tm-theme'
 const DEFAULT_THEME: ThemeName = 'tactical'
 
