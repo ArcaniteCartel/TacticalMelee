@@ -280,7 +280,7 @@ export function GmControls(): JSX.Element {
 
         {isComplete && (
           <Tooltip
-            label={`Advances to round ${nextRound}. The beat budget resets to the full ${tc?.totalBeats ?? 72} beats and the stage pipeline is rebuilt for the new round.`}
+            label={`Advances to round ${nextRound}. The beat budget resets to the full ${tc?.totalBeats ?? 60} beats and the stage pipeline is rebuilt for the new round.`}
             {...tipProps}
           >
             <Button

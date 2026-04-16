@@ -7,12 +7,12 @@
  *
  * All other modules query this class — never access plugin data directly.
  *
- * Beat budget rationale (Standard plugin, 72 beats per TC):
+ * Beat budget rationale (Standard plugin, 60 beats per TC):
  *   Pre-Encounter  4b  — short window; players already know their loadouts
- *   Action         6b  — the primary decision window; the most expensive phase
+ *   Action         4b  — the primary decision window
  *   Response       4b  — reactive; options are narrower than a full action
  *   System stages  0b  — computation only; no in-world time is consumed
- *   Total scheduled per round (R2+): 10b, leaving ~62b for narrative/organic time
+ *   Action Tier    8b  — Action + Response per tier; 7 tiers fit exactly in 56b (60 − 4 preamble)
  *
  * Timer rationale:
  *   Pre-Encounter  20s  — enough for a simple swap or consumption decision
@@ -25,8 +25,8 @@ import type { PluginConfig, StageDefinition } from '../../shared/types'
 export class ActivePlugin {
   private static readonly STANDARD_CONFIG: PluginConfig = {
     pluginName: 'TacticalMelee Standard',
-    // 72 beats represents one full in-world Tactical Cycle (~1 minute of combat time)
-    beatsPerTC: 72,
+    // 60 beats represents one full in-world Tactical Cycle (~1 minute of combat time)
+    beatsPerTC: 60,
     // StagePlanner will never pro-rate an Action/Response timer below this value.
     // 5 s is the practical floor: shorter than this gives players no meaningful decision window.
     minAdjustedTimerSeconds: 5,
@@ -80,7 +80,7 @@ export class ActivePlugin {
         id: 'action',
         name: 'Action',
         type: 'action',
-        beats: 6,           // 6b — the most expensive phase; represents the main combat exchange
+        beats: 4,           // 4b — matches Response; each tier costs 8b total (Action + Response)
         timerSeconds: 30,   // 30s player clock; GM hold phase precedes this (see stageGMHold)
         canPass: true,      // GM can skip if no meaningful action is possible this round
         description:
