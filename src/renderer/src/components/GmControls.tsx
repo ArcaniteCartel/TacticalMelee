@@ -3,19 +3,22 @@ import { Stack, Group, Button, Paper, Text, Badge, Divider, CloseButton, Tooltip
 import {
   IconSwords, IconPlayerPlay, IconPlayerPause, IconPlayerSkipForward,
   IconFlag, IconDeviceTv, IconSkull, IconRotateClockwise, IconClock,
+  IconArrowBackUp, IconPlayerSkipBack,
 } from '@tabler/icons-react'
 import type { TCStatePayload, StageDefinition } from '@shared/types'
 
 // ── Tooltip text helpers ─────────────────────────────────────────────────────
 // Each function returns a context-appropriate explanation for its control.
-// Beat-effect differences between GM Release and GM Pass are explicitly called out.
+// Beat-effect differences between GM Release, GM Pass, Stage Reset, and Tier Reset
+// are explicitly called out so the GM always knows the beat-budget consequence.
 
 /**
  * Context-sensitive tooltip for the GM Release button.
- * The effect of Release changes significantly depending on current machine state:
- *   stageGMHold  → starts the player countdown (no beats charged yet)
- *   stageActive  → ends stage early with proportional beat charge
- *   stageSpin    → ends spin window early (only when ops complete)
+ *
+ * Release from stageGMHold    → starts player countdown (no beats charged yet)
+ * Release from stageActive    → ends stage early; elapsed beats consumed; surplus
+ *                               carries forward to the next beat-consuming stage
+ * Release from stageSpin      → ends spin early (only when ops complete)
  */
 function releaseTooltip(
   isGMHold: boolean,
@@ -31,7 +34,7 @@ function releaseTooltip(
     if (stage?.type === 'gm-release') {
       return 'Ends this narrative stage and advances. This stage type has no beat cost — releasing has no effect on the beat budget.'
     }
-    return 'Ends this stage early.\n\nBeats are charged proportionally to elapsed time only. If half the timer ran, half the stage\'s beats are consumed. The unelapsed time is forfeited.'
+    return 'Ends this stage early.\n\nBeats are charged proportionally to elapsed time. Unelapsed beats carry forward to the next stage, extending it — nothing is lost from the budget.'
   }
   if (isSpin) {
     if (opsComplete) return 'Ends the spin window early and advances to the next stage.'
@@ -41,16 +44,34 @@ function releaseTooltip(
 }
 
 /**
- * Context-sensitive tooltip for the Pass Stage button.
- * Pass always consumes zero beats — the budget is restored to where it was
- * when the stage was entered. This is distinct from GM Release, which charges
- * proportional beats for any time already elapsed.
+ * Tooltip for the Pass Stage button.
+ * Full beat cost is always charged — whether the timer has started or not.
+ * The stage window existed in the timeline regardless, so beats are consumed.
+ * No carry-forward in either case.
  */
 function passTooltip(isGMHold: boolean): string {
   if (isGMHold) {
-    return 'Skips this stage before the timer starts.\n\nZero beats consumed — the beat budget is fully restored to its value at stage entry. Nothing is charged.'
+    return 'Skips this stage before the timer starts.\n\nThe full beat cost of this stage is charged — the window existed in the timeline regardless of whether the timer ran.\n\nUnlike GM Release, no beats carry forward.'
   }
-  return 'Skips the remainder of this stage.\n\nZero beats consumed — the beat budget is restored to its value when this stage began.\n\nUnlike GM Release, no elapsed time is charged against the budget.'
+  return 'Skips the remainder of this stage.\n\nThe full beat cost of this stage is charged — no carry-forward. This represents the characters doing nothing during the window.\n\nUnlike GM Release, unelapsed beats are NOT carried to the next stage.'
+}
+
+/**
+ * Tooltip for the Stage Reset button.
+ * Restarts the current stage, restoring the beat clock to its stage-entry value.
+ * Any carry-forward beats already added to this stage's allocation are preserved.
+ */
+function stageResetTooltip(): string {
+  return 'Restarts the current stage from its beginning.\n\nThe beat clock is restored to where it was when this stage started. Any extra beats added by a carry-forward are preserved.\n\nUse this to grant the group a redo on the current stage.'
+}
+
+/**
+ * Tooltip for the Tier Reset button.
+ * Backs up to the opening Action stage of the entire current tier,
+ * restoring the beat clock to its tier-entry value.
+ */
+function tierResetTooltip(): string {
+  return 'Restarts the entire current Action Tier from its opening Action stage.\n\nThe beat clock is restored to where it was at the start of this tier. All stages in the tier repeat.\n\nUse this to grant the group a full redo of the tier.'
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -86,19 +107,25 @@ export function GmControls(): JSX.Element {
 
   // GM Release:
   //   stageGMHold  → starts the player countdown (always enabled)
-  //   stageActive  → ends stage early, partial beats consumed
+  //   stageActive  → ends stage early; surplus beats carry forward
   //   stageSpin    → ends spin early when ops complete
   const canRelease     = isGMHold ||
                          (isActive && (currentStage?.type === 'gm-release' || (currentStage?.timerSeconds ?? 0) > 0)) ||
                          (isSpin && tc?.backgroundOpsComplete === true)
   const showRelease    = inCombat && !isComplete && !isBattleEnded
 
-  // GM Pass: skips stage, zero beats consumed. Available in hold phase (skips before timer starts).
+  // GM Pass: available in hold phase (zero cost) or active phase (full beat cost charged).
   const canPass        = (isGMHold || isActive || isPaused) && currentStage?.canPass === true
 
   // Pause: all non-gm-release stages in stageActive or stageSpin. NOT during stageGMHold.
   const canPause       = (isActive && currentStage?.type !== 'gm-release') || isSpin
   const canResume      = isPaused || isSpinPaused
+
+  // Stage Reset: restarts current stage. Available in stageActive or stageSpin only.
+  const canStageReset  = (isActive || isSpin) && inCombat
+
+  // Tier Reset: restarts entire Action Tier. Only available when on a tier stage (has tierIndex).
+  const canTierReset   = canStageReset && currentStage?.tierIndex !== undefined
 
   const canEndBattle   = !isIdle && !isBattleEnded
   const canReset       = true
@@ -293,6 +320,39 @@ export function GmControls(): JSX.Element {
           </Tooltip>
         )}
       </Group>
+
+      {/* Reset controls — available during active stages to redo a stage or tier */}
+      {(canStageReset || canTierReset) && (
+        <>
+          <Divider color="var(--tm-border)" />
+          <Group gap="sm" wrap="wrap">
+            {canStageReset && (
+              <Tooltip label={stageResetTooltip()} {...tipProps}>
+                <Button
+                  leftSection={<IconArrowBackUp size={16} />}
+                  color="orange"
+                  variant="outline"
+                  onClick={() => window.api.stageReset()}
+                >
+                  Stage Reset
+                </Button>
+              </Tooltip>
+            )}
+            {canTierReset && (
+              <Tooltip label={tierResetTooltip()} {...tipProps}>
+                <Button
+                  leftSection={<IconPlayerSkipBack size={16} />}
+                  color="orange"
+                  variant="outline"
+                  onClick={() => window.api.tierReset()}
+                >
+                  Tier Reset
+                </Button>
+              </Tooltip>
+            )}
+          </Group>
+        </>
+      )}
 
       {/* Danger zone — always visible when relevant */}
       {(canEndBattle || canReset) && (

@@ -11,6 +11,8 @@ const api = {
   resume:      (): void => ipcRenderer.send('tc:resume'),
   nextRound:    (): void => ipcRenderer.send('tc:next-round'),
   launchHUD:    (): void => ipcRenderer.send('tc:launch-hud'),
+  stageReset:   (): void => ipcRenderer.send('tc:stage-reset'),
+  tierReset:    (): void => ipcRenderer.send('tc:tier-reset'),
   endBattle:    (): void => ipcRenderer.send('tc:end-battle'),
   resetBattle:  (): void => ipcRenderer.send('tc:reset'),
 

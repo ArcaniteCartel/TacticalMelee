@@ -32,6 +32,13 @@ let spinTickInterval: ReturnType<typeof setInterval> | null = null
 let prevMachineState: string | null = null
 let prevStageIndex: number = -1
 
+// Holds a Response stage's surplus beats that should carry forward to the next tier's
+// Action, but are deferred until the current tier's Resolution spin completes.
+// Deferral ensures Tier Reset (available through Response, not after Resolution) and
+// cross-tier carry are mutually exclusive — no double-counting on reset.
+// Cleared when a Stage Reset or Tier Reset is detected.
+let pendingCrossTierCarry: { fromStageIndex: number; surplusBeats: number } | null = null
+
 // ── Timer management ─────────────────────────────────────────────────────────
 
 function startSpinTicker(): void {
@@ -137,44 +144,111 @@ tcActor.subscribe((snapshot) => {
     }
   }
 
-  // ── StagePlanner — Resolution-complete detection ─────────────────────────
+  // ── StagePlanner — Carry-forward detection ────────────────────────────────
   //
-  // Detect when a Resolution stage's spin has just ended (machine left stageSpin
-  // and the previous stage was of type 'resolution'). This is the RESOLUTION_COMPLETE
-  // trigger point: the StagePlanner replans the last tier with actual beatsRemaining,
-  // accounting for drift caused by partial GM Releases or Passes in earlier stages.
+  // When a timed stage exits via GM Release (early end), the machine preserves
+  // beatsRemaining at the partial value. Surplus beats = the portion of the stage's
+  // beat allocation that was not consumed. These are forwarded to the next beat-
+  // consuming stage in the pipeline to extend its allocation.
   //
-  // The detection uses prevMachineState (set at end of previous subscription tick)
-  // and prevStageIndex to identify the just-completed stage. checkAdvance is a
-  // skipped transient state, so prevMachineState correctly reflects 'stageSpin'.
-  {
-    const prevStage = stages[prevStageIndex]
-    const resolutionComplete = (
-      prevMachineState === 'stageSpin' &&
-      prevStage?.type === 'resolution' &&
-      state !== 'stageSpin' &&
-      state !== 'stageSpinPaused'
-    )
+  // Detection: stageActive → stageSpin for beat-consuming stages (spinTime > 0).
+  // snapshot.context.beatsAtStageEntry still reflects the exiting stage's entry value.
+  //
+  // surplusBeats = beatsRemaining − (beatsAtStageEntry − stage.beats)
+  //   > 0  → GM Release left unconsumed beats → carry forward
+  //   = 0  → natural expiry or GM Pass (full cost charged) → no carry forward
+  //
+  // Routing:
+  //   Response stage → cross-tier carry (Response → next tier's Action).
+  //     DEFERRED: stored in pendingCrossTierCarry and applied only when the current
+  //     tier's Resolution spin completes. This makes Tier Reset and cross-tier carry
+  //     mutually exclusive — the reset window closes before the carry is applied.
+  //   All other timed stages (Action, Pre-Encounter, Morale) → intra-tier or
+  //     same-round carry. Applied IMMEDIATELY via UPDATE_PIPELINE.
 
-    if (resolutionComplete) {
-      if (state === 'tcComplete') {
-        // Round ended after the final Resolution. Any beats remaining are residual —
-        // log them for future algorithm analysis; they have no mechanical effect.
-        if (snapshot.context.beatsRemaining > 0.05) {
-          logger.info(
-            { residualBeats: snapshot.context.beatsRemaining, round: snapshot.context.round },
-            'StagePlanner: residual beats discarded at TC end'
-          )
-        }
-      } else {
-        // More tiers remain — replan the last tier's beat allocation with the
-        // actual live beatsRemaining (may differ from the initial projection).
-        const completedTierIndex = prevStage.tierIndex ?? -1
-        if (completedTierIndex >= 0) {
-          const updatedStages = stagePlanner.replan(stages, snapshot.context.beatsRemaining, completedTierIndex)
-          tcActor.send({ type: 'UPDATE_PIPELINE', stages: updatedStages })
+  if (prevMachineState === 'stageActive' && state === 'stageSpin') {
+    const prevStage = stages[prevStageIndex]
+    if (prevStage && prevStage.beats > 0 && isTimedStageType(prevStage.type)) {
+      const fullCostRemaining = snapshot.context.beatsAtStageEntry - prevStage.beats
+      const surplusBeats = snapshot.context.beatsRemaining - fullCostRemaining
+
+      if (surplusBeats > 0.05) {
+        if (prevStage.type === 'response') {
+          // Cross-tier carry: defer until this tier's Resolution spin completes.
+          // Tier Reset is no longer available after Resolution, so the carry can be
+          // safely applied then without risk of double-counting on reset.
+          pendingCrossTierCarry = { fromStageIndex: prevStageIndex, surplusBeats }
+        } else {
+          // Intra-tier or pre-preamble carry (Action → Response, Pre-Encounter → Tier 1 Action, etc.)
+          // Apply immediately — no reset can undo a stage that has already completed.
+          const updatedStages = stagePlanner.applyCarryForward(stages, prevStageIndex, surplusBeats)
+          if (updatedStages !== stages) {
+            tcActor.send({ type: 'UPDATE_PIPELINE', stages: updatedStages })
+          }
         }
       }
+    }
+  }
+
+  // ── Reset detection — clear pending cross-tier carry ─────────────────────
+  //
+  // Stage Reset and Tier Reset are visible as:
+  //   stageActive → stageGMHold     (always a reset — normal exits never go there directly)
+  //   stageSpin   → stageGMHold with currentStageIndex ≤ prevStageIndex (backward/same = reset)
+  //
+  // Normal forward advance: stageSpin → stageGMHold with currentStageIndex > prevStageIndex.
+  //
+  // When a reset fires while pendingCrossTierCarry is set (e.g. Response released early,
+  // then Tier Reset from Resolution spin), the pending carry is simply discarded — the
+  // tier is replaying from the start and the surplus beats are forfeited.
+
+  if (
+    state === 'stageGMHold' &&
+    (prevMachineState === 'stageActive' ||
+      (prevMachineState === 'stageSpin' && currentStageIndex <= prevStageIndex))
+  ) {
+    pendingCrossTierCarry = null
+  }
+
+  // ── Deferred cross-tier carry — apply when Resolution spin completes ──────
+  //
+  // Fires when the tier's Resolution spin finishes and the machine advances normally
+  // into the next tier's Action stageGMHold (forward index, not a reset).
+  // At this point the Tier Reset window for the completed tier is permanently closed,
+  // so applying the carry cannot cause double-counting.
+
+  else if (
+    prevMachineState === 'stageSpin' &&
+    stages[prevStageIndex]?.type === 'resolution' &&
+    state === 'stageGMHold' &&
+    currentStageIndex > prevStageIndex &&
+    pendingCrossTierCarry !== null
+  ) {
+    const { fromStageIndex, surplusBeats } = pendingCrossTierCarry
+    pendingCrossTierCarry = null
+    const updatedStages = stagePlanner.applyCarryForward(stages, fromStageIndex, surplusBeats)
+    if (updatedStages !== stages) {
+      tcActor.send({ type: 'UPDATE_PIPELINE', stages: updatedStages })
+    }
+  }
+
+  // ── Residual beat logging at TC end ──────────────────────────────────────
+  //
+  // If the final Resolution spin completes and the TC ends with beatsRemaining > 0,
+  // log the residual for algorithm analysis. Residual beats have no mechanical effect —
+  // the next round starts fresh from totalBeats.
+  {
+    const prevStage = stages[prevStageIndex]
+    if (
+      prevMachineState === 'stageSpin' &&
+      prevStage?.type === 'resolution' &&
+      state === 'tcComplete' &&
+      snapshot.context.beatsRemaining > 0.05
+    ) {
+      logger.info(
+        { residualBeats: snapshot.context.beatsRemaining, round: snapshot.context.round },
+        'StagePlanner: residual beats at TC end'
+      )
     }
   }
 
@@ -233,11 +307,14 @@ ipcMain.on('tc:start-combat', () => {
   tcActor.send({ type: 'START_COMBAT', stages, beatsPerTC })
 })
 
-// In stageGMHold: starts the player countdown. In stageActive: ends stage early (partial beats).
+// In stageGMHold: starts the player countdown. In stageActive: ends stage early;
+// surplus beats carry forward to the next beat-consuming stage via UPDATE_PIPELINE.
 // In stageSpin: ends spin early (only when backgroundOpsComplete is true).
 ipcMain.on('tc:gm-release', () => tcActor.send({ type: 'GM_RELEASE' }))
 
-// Skips the current stage — zero beats consumed, beatsRemaining restored to stage-entry value.
+// Skips the current stage.
+// From stageGMHold: zero beats consumed (administrative — timer never started).
+// From stageActive: full stage beat cost charged (characters did nothing this window).
 ipcMain.on('tc:pass',       () => tcActor.send({ type: 'PASS' }))
 
 // Freezes the active timer (stageActive → stagePaused, stageSpin → stageSpinPaused).
@@ -245,6 +322,16 @@ ipcMain.on('tc:pause',      () => tcActor.send({ type: 'PAUSE' }))
 
 // Resumes from either paused state back to its respective active state.
 ipcMain.on('tc:resume',     () => tcActor.send({ type: 'RESUME' }))
+
+// Restarts the current stage from its beginning.
+// Beat clock restored to beatsAtStageEntry; machine returns to stageGMHold.
+// Available in stageActive and stageSpin only.
+ipcMain.on('tc:stage-reset', () => tcActor.send({ type: 'STAGE_RESET' }))
+
+// Restarts the entire current Action Tier from its opening Action stage.
+// Beat clock restored to beatsAtTierEntry; machine returns to stageGMHold for the tier's Action.
+// Only fires when the current stage has a tierIndex (tier stages only).
+ipcMain.on('tc:tier-reset',  () => tcActor.send({ type: 'TIER_RESET' }))
 
 // Increments round, reloads round-filtered + StagePlanner-expanded stage list,
 // resets beat ledger to totalBeats.

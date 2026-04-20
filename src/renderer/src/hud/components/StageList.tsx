@@ -127,6 +127,17 @@ export function StageList({ stages, currentIndex, machineState }: StageListProps
   )
 }
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Formats a beat count for display. Whole numbers render without a decimal (e.g. "4");
+ * fractional values (carry-inflated stages) render at 1dp (e.g. "4.7"). This matches the
+ * 1dp precision used by the beats burndown so consumed + carry always appear consistent.
+ */
+function formatBeats(b: number): string {
+  return Number.isInteger(b) ? String(b) : b.toFixed(1)
+}
+
 // ── StageCard ────────────────────────────────────────────────────────────────
 
 interface StageCardProps {
@@ -172,14 +183,19 @@ function StageCard({ stage, idx, currentIndex, isComplete }: StageCardProps): JS
           </Text>
         </Group>
 
-        {stage.beats > 0 && (
-          <Text size="xs" c="dimmed">{stage.beats}b</Text>
+        {/* Only show beat allocation on active/upcoming stages.
+            Completed stages omit it: a released stage's allocation ≠ actual beats consumed,
+            so showing it would be misleading. The burndown bar is the authoritative total.
+            Beats are displayed at 1dp when fractional (e.g. carry-inflated 4.7b) and as
+            integers otherwise (4b), matching the burndown's toFixed(1) precision. */}
+        {!isDone && stage.beats > 0 && (
+          <Text size="xs" c="dimmed">{formatBeats(stage.beats)}b</Text>
         )}
       </Group>
 
       {isActive && stage.type === 'timed' && stage.timerSeconds && (
         <Text size="xs" c="dimmed" mt={2}>
-          {stage.timerSeconds}s · {stage.beats} beat{stage.beats !== 1 ? 's' : ''}
+          {stage.timerSeconds}s · {formatBeats(stage.beats)} beat{stage.beats !== 1 ? 's' : ''}
         </Text>
       )}
     </Box>

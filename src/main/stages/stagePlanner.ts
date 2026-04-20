@@ -2,19 +2,30 @@
  * StagePlanner
  *
  * Expands the round's stage pipeline by repeating the Action Tier triad
- * (Action → Response → Resolution) as many times as the beat budget allows,
- * then adjusts the last tier's Action/Response beat allocation so the total
- * projected beat consumption equals beatsPerTC exactly.
+ * (Action → Response → Resolution) as many times as the beat budget allows.
+ * No last-tier beat adjustment is made — all tiers run at the plugin-defined
+ * beat cost. Unelapsed beats from early GM Releases carry forward to the next
+ * beat-consuming stage via applyCarryForward().
  *
- * Tier count is determined once at round start (plan()). After every Resolution
- * spin completes, replan() recalculates only the last tier's beat allocation
- * using the actual live beatsRemaining, accounting for drift caused by partial
- * GM Releases or Passes in earlier stages.
+ * Tier count is determined once at round start (plan()). Carry-forward is
+ * applied inline in index.ts after each GM Release: the surplus beats
+ * (stage.beats − beats_consumed) are added to the next beat-consuming stage
+ * in the pipeline and its timer is extended proportionally.
+ *
+ * Beat carry-forward routing:
+ *   Pre-Encounter early release → surplus added to first Action stage (Tier 1)
+ *   Action early release        → surplus added to Response (same tier)
+ *   Response early release      → surplus added to Action (next tier)
+ *   Final Response early release → no next stage; surplus logged and discarded
+ *
+ * "Next beat-consuming stage" is the first stage after the source with beats > 0.
+ * 0-beat system stages (Resolution, Surprise Determination, etc.) are naturally
+ * skipped by this rule.
  *
  * Calculation sequence:
  *   Each StageDefinition may carry an optional `calculationSequence` DSL string.
- *   If any stage in the pipeline declares one, the first found drives tier-count
- *   and beat-allocation logic (DSL interpreter not yet built — future extension).
+ *   If any stage in the pipeline declares one, the first found is logged as a
+ *   warning (DSL interpreter not yet built — future extension).
  *   If no stage declares a sequence, the system default arithmetic is used.
  *
  * ID collision avoidance:
@@ -44,16 +55,6 @@ export class StagePlanner {
   /** Minimum timer (seconds) for any StagePlanner-adjusted stage. Plugin-defined. */
   private readonly minTimerSeconds: number
 
-  /**
-   * Original plugin beat and timer values for the triad's adjustable stages.
-   * Captured during plan() and used in all subsequent replan() calls to preserve
-   * the original Action:Response beat ratio regardless of how many times it is adjusted.
-   */
-  private originalActionBeats   = 0
-  private originalActionTimer   = 0
-  private originalResponseBeats = 0
-  private originalResponseTimer = 0
-
   constructor(minTimerSeconds: number) {
     this.minTimerSeconds = minTimerSeconds
   }
@@ -69,7 +70,9 @@ export class StagePlanner {
    *   3. Greedy floor: tierCount = ⌊available / triadBeats⌋.
    *   4. Build expanded pipeline: preamble + tierCount copies of the triad, each with a
    *      scoped ID (action-t1, response-t1, ...) and a tierIndex.
-   *   5. Adjust the last tier's Action/Response beats to fill the remaining beat budget.
+   *
+   * No last-tier beat adjustment is made. Tiers run at their plugin-defined beat cost.
+   * Carry-forward from early releases handles beat redistribution organically.
    *
    * If the pipeline contains no triad stages, it is returned unchanged.
    * If a calculationSequence DSL is found on any stage, the first one wins (stub — not yet executed).
@@ -92,12 +95,6 @@ export class StagePlanner {
       logger.debug('StagePlanner: no triad found — pipeline unchanged')
       return [...pipeline]
     }
-
-    // Capture originals for ratio-preserving adjustments throughout the round
-    this.originalActionBeats   = actionTemplate.beats
-    this.originalActionTimer   = actionTemplate.timerSeconds ?? 0
-    this.originalResponseBeats = responseTemplate.beats
-    this.originalResponseTimer = responseTemplate.timerSeconds ?? 0
 
     // Preamble = all stages before the first triad stage; their beats are a fixed cost
     const triadStartIndex = pipeline.findIndex(s => isTriadType(s.type))
@@ -130,12 +127,8 @@ export class StagePlanner {
       )
     }
 
-    // Adjust last tier: first (tierCount - 1) tiers run at full beats; the last fills the remainder
-    const remainder = available - (tierCount - 1) * triadBeats
-    this.applyLastTierAdjustment(expanded, tierCount - 1, remainder)
-
     logger.info(
-      { tierCount, beatsPerTC, preambleBeats, triadBeats, lastTierBeats: remainder },
+      { tierCount, beatsPerTC, preambleBeats, triadBeats },
       'StagePlanner: pipeline expanded'
     )
 
@@ -143,178 +136,71 @@ export class StagePlanner {
   }
 
   /**
-   * Replan after every Resolution spin completes.
+   * Applies carry-forward surplus beats to the next beat-consuming stage after the source.
    *
-   * Recalculates the last tier's Action/Response allocation using the actual live
-   * beatsRemaining, which may differ from the initial projection because of partial
-   * GM Releases or Passes in earlier stages.
+   * Called by index.ts after detecting that a GM Release left surplus beats
+   * (surplusBeats = stage.beats − beatsConsumed > 0). The surplus is added to the
+   * next stage in the pipeline whose beats > 0. Its timer is extended proportionally
+   * using the current beats-per-second ratio (preserving pace, subject to minTimerSeconds).
    *
-   * The last tier's allocation is computed as:
-   *   lastTierBeats = beatsRemaining − (fullTriadsRemaining × originalTriadBeats)
+   * Returns an updated pipeline copy. If no target stage is found (e.g. last Response
+   * of the final tier), the pipeline is returned unchanged and the surplus is logged
+   * as discarded.
    *
-   * where fullTriadsRemaining = (maxTierIndex − completedTierIndex − 1).
-   *
-   * Returns an updated copy of the pipeline (does not mutate the input).
-   * Tier count is never changed by a replan.
+   * Note: carry-forward additions to the target stage persist through Stage Reset and
+   * Tier Reset — only the beat clock is restored, not the pipeline stage beats.
    */
-  replan(pipeline: StageDefinition[], beatsRemaining: number, completedTierIndex: number): StageDefinition[] {
-    const maxTier = this.findMaxTierIndex(pipeline)
-    if (maxTier < 0) return pipeline  // no triad in pipeline — nothing to adjust
+  applyCarryForward(
+    pipeline: StageDefinition[],
+    fromStageIndex: number,
+    surplusBeats: number
+  ): StageDefinition[] {
+    if (surplusBeats <= 0.05) return pipeline  // below threshold — nothing meaningful to carry
 
-    const fullTriadsRemaining = maxTier - completedTierIndex - 1
-    const fullTriadBeats      = this.originalActionBeats + this.originalResponseBeats
-    const lastTierBeats       = beatsRemaining - fullTriadsRemaining * fullTriadBeats
+    // Find the next beat-consuming stage after the source
+    const targetIndex = pipeline.findIndex((s, i) => i > fromStageIndex && s.beats > 0)
 
-    if (lastTierBeats < 2) {
-      // Extremely unlikely — safety clamp so hard constraints (≥1 beat each) can always be met
-      logger.warn(
-        { beatsRemaining, fullTriadsRemaining, fullTriadBeats, lastTierBeats },
-        'StagePlanner: replan produced near-zero last tier beats — clamping to minimum'
+    if (targetIndex === -1) {
+      // No next beat-consuming stage — last Response of the final tier.
+      // Surplus is forfeited and will be logged as residual at TC completion.
+      logger.debug(
+        { fromStageIndex, surplusBeats },
+        'StagePlanner: carry-forward has no target — surplus forfeited'
       )
-      return this.applyLastTierAdjustmentCopy(pipeline, maxTier, 2)
+      return pipeline
     }
 
-    const updated = this.applyLastTierAdjustmentCopy(pipeline, maxTier, lastTierBeats)
+    const target    = pipeline[targetIndex]
+    const newBeats  = round2(target.beats + surplusBeats)
+
+    // Extend the timer proportionally to the new beat allocation.
+    // Uses the current beats/timer ratio so the pace (seconds per beat) is preserved.
+    const newTimer  = target.timerSeconds
+      ? this.proRateTimer(newBeats, target.beats, target.timerSeconds)
+      : undefined
 
     logger.debug(
-      { beatsRemaining, completedTierIndex, maxTier, fullTriadsRemaining, lastTierBeats },
-      'StagePlanner: last tier re-adjusted after resolution'
+      { fromStageIndex, targetIndex, targetId: target.id, surplusBeats, newBeats, newTimer },
+      'StagePlanner: carry-forward applied'
     )
 
-    return updated
-  }
-
-  // ── Private helpers ─────────────────────────────────────────────────────────
-
-  /** Returns the highest tierIndex present in the pipeline; -1 if none found. */
-  private findMaxTierIndex(pipeline: StageDefinition[]): number {
-    let max = -1
-    for (const s of pipeline) {
-      if (s.tierIndex !== undefined && s.tierIndex > max) max = s.tierIndex
-    }
-    return max
-  }
-
-  /**
-   * Mutates the expanded array in-place to apply beat/timer adjustments to
-   * the last tier's Action and Response stages.
-   * Only called from plan() where the array is freshly constructed.
-   */
-  private applyLastTierAdjustment(
-    expanded: StageDefinition[],
-    lastTierIdx: number,
-    beatsAvailable: number
-  ): void {
-    const { adjAction, adjResponse } = this.distributeBeats(beatsAvailable)
-    for (let i = 0; i < expanded.length; i++) {
-      const s = expanded[i]
-      if (s.tierIndex !== lastTierIdx) continue
-      if (s.type === 'action') {
-        expanded[i] = {
-          ...s,
-          beats:        adjAction,
-          timerSeconds: this.proRateTimer(adjAction, this.originalActionBeats, this.originalActionTimer),
-        }
-      } else if (s.type === 'response') {
-        expanded[i] = {
-          ...s,
-          beats:        adjResponse,
-          timerSeconds: this.proRateTimer(adjResponse, this.originalResponseBeats, this.originalResponseTimer),
-        }
+    return pipeline.map((s, i) => {
+      if (i !== targetIndex) return s
+      return {
+        ...s,
+        beats: newBeats,
+        ...(newTimer !== undefined ? { timerSeconds: newTimer } : {}),
       }
-    }
-  }
-
-  /**
-   * Returns an updated pipeline copy with the last tier's Action/Response adjusted.
-   * Used by replan() — the live pipeline must not be mutated in place.
-   */
-  private applyLastTierAdjustmentCopy(
-    pipeline: StageDefinition[],
-    lastTierIdx: number,
-    beatsAvailable: number
-  ): StageDefinition[] {
-    const { adjAction, adjResponse } = this.distributeBeats(beatsAvailable)
-    return pipeline.map(s => {
-      if (s.tierIndex !== lastTierIdx) return s
-      if (s.type === 'action') {
-        return {
-          ...s,
-          beats:        adjAction,
-          timerSeconds: this.proRateTimer(adjAction, this.originalActionBeats, this.originalActionTimer),
-        }
-      }
-      if (s.type === 'response') {
-        return {
-          ...s,
-          beats:        adjResponse,
-          timerSeconds: this.proRateTimer(adjResponse, this.originalResponseBeats, this.originalResponseTimer),
-        }
-      }
-      return s
     })
   }
 
-  /**
-   * Distributes beatsAvailable across Action and Response, preserving the original ratio.
-   *
-   * Rules (applied in order):
-   *   1. If the proportional split produces exact integers, use them directly.
-   *   2. Otherwise round to integers; choose the rounding with the most balanced split
-   *      (minimises |adjAction − adjResponse|).
-   *   3. For fractional beatsAvailable (replan path), clamp proportional result to [1, total−1].
-   *   4. Hard constraint (all paths): neither stage may receive 0 beats or all beats (min 1 each).
-   */
-  private distributeBeats(beatsAvailable: number): { adjAction: number; adjResponse: number } {
-    const a     = this.originalActionBeats
-    const r     = this.originalResponseBeats
-    const total = a + r
-
-    // Safety: not enough beats to give at least 1 to each
-    if (total <= 0 || beatsAvailable < 2) {
-      return { adjAction: 1, adjResponse: Math.max(1, beatsAvailable - 1) }
-    }
-
-    const propA = beatsAvailable * (a / total)
-
-    if (Number.isInteger(beatsAvailable)) {
-      // Initial planning path: beatsAvailable is always an integer here.
-      // Prefer exact integer split; fall back to the more balanced rounding.
-      if (Number.isInteger(propA)) {
-        const adjR = beatsAvailable - propA
-        if (propA >= 1 && adjR >= 1) return { adjAction: propA, adjResponse: adjR }
-      }
-
-      const floorA = Math.floor(propA)
-      const ceilA  = Math.ceil(propA)
-      const floorR = beatsAvailable - floorA
-      const ceilR  = beatsAvailable - ceilA
-
-      const floorOk = floorA >= 1 && floorR >= 1
-      const ceilOk  = ceilA  >= 1 && ceilR  >= 1
-
-      if (floorOk && ceilOk) {
-        // Pick whichever split is more balanced (smaller absolute difference)
-        return Math.abs(floorA - floorR) <= Math.abs(ceilA - ceilR)
-          ? { adjAction: floorA, adjResponse: floorR }
-          : { adjAction: ceilA,  adjResponse: ceilR  }
-      }
-      if (floorOk) return { adjAction: floorA, adjResponse: floorR }
-      if (ceilOk)  return { adjAction: ceilA,  adjResponse: ceilR  }
-    }
-
-    // Replan path: beatsRemaining is a running float — keep proportional, clamp to constraints.
-    // round2() prevents floating-point trailing noise (e.g. 8.096000000000001 → 8.1).
-    const adjA = round2(Math.max(1, Math.min(beatsAvailable - 1, propA)))
-    const adjR = round2(beatsAvailable - adjA)
-    return { adjAction: adjA, adjResponse: adjR }
-  }
+  // ── Private helpers ─────────────────────────────────────────────────────────
 
   /**
    * Pro-rates a timer proportionally to the adjusted beat allocation.
    * Rounds to whole seconds and enforces the plugin-defined minimum floor.
    *
-   * Example: originalBeats=6, originalTimer=30s, adjustedBeats=4 → (4/6)×30 = 20s.
+   * Example: originalBeats=4, originalTimer=30s, adjustedBeats=6 → (6/4)×30 = 45s.
    */
   private proRateTimer(adjustedBeats: number, originalBeats: number, originalTimer: number): number {
     if (originalBeats <= 0 || originalTimer <= 0) return this.minTimerSeconds

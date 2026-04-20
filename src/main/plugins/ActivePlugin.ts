@@ -8,11 +8,13 @@
  * All other modules query this class — never access plugin data directly.
  *
  * Beat budget rationale (Standard plugin, 60 beats per TC):
- *   Pre-Encounter  4b  — short window; players already know their loadouts
+ *   Pre-Encounter  4b  — round 1 only; short window for gear/positioning before combat starts
+ *   Morale         4b  — round 2+ only; replaces Pre-Encounter as the 4b preamble stage
  *   Action         4b  — the primary decision window
  *   Response       4b  — reactive; options are narrower than a full action
  *   System stages  0b  — computation only; no in-world time is consumed
  *   Action Tier    8b  — Action + Response per tier; 7 tiers fit exactly in 56b (60 − 4 preamble)
+ *   Both rounds: preamble is always 4b, leaving exactly 56b for 7 × 8b tiers
  *
  * Timer rationale:
  *   Pre-Encounter  20s  — enough for a simple swap or consumption decision
@@ -53,6 +55,18 @@ export class ActivePlugin {
           'Make pre-combat adjustments — swap weapons, consume items, or declare readiness. 4 beats remain.',
         roundVisibility: ['A1', 'I2'], // round 1 only — subsequent rounds begin mid-combat, no setup window
         spinTime: 3,        // 3s for surprise/initiative system stages to begin queuing
+      },
+      {
+        id: 'morale',
+        name: 'Morale',
+        type: 'timed',
+        beats: 4,           // 4b — same preamble cost as Pre-Encounter; keeps tier count at 7
+        timerSeconds: 20,   // 20s window; same pace as Pre-Encounter (1 beat every 5s)
+        canPass: true,
+        description:
+          'Perform morale actions before the round begins. Players and NPCs with morale abilities may act now.',
+        roundVisibility: ['i1'], // round 2 and later only — round 1 uses Pre-Encounter instead
+        spinTime: 3,        // same 3s spin as Pre-Encounter for consistency
       },
       {
         id: 'surprise-determination',
