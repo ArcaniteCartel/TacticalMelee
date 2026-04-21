@@ -3,7 +3,7 @@ import { Stack, Group, Button, Paper, Text, Badge, Divider, CloseButton, Tooltip
 import {
   IconSwords, IconPlayerPlay, IconPlayerPause, IconPlayerSkipForward,
   IconFlag, IconDeviceTv, IconSkull, IconRotateClockwise, IconClock,
-  IconArrowBackUp, IconPlayerSkipBack,
+  IconArrowBackUp, IconArrowBackUpDouble, IconPlayerSkipBack, IconClipboardList,
 } from '@tabler/icons-react'
 import type { TCStatePayload, StageDefinition } from '@shared/types'
 
@@ -74,9 +74,21 @@ function tierResetTooltip(): string {
   return 'Restarts the entire current Action Tier from its opening Action stage.\n\nThe beat clock is restored to where it was at the start of this tier. All stages in the tier repeat.\n\nUse this to grant the group a full redo of the tier.'
 }
 
+/**
+ * Tooltip for the Round Reset button.
+ * Returns to stage 0 of the current round, restoring the full beat budget.
+ */
+function roundResetTooltip(): string {
+  return 'Restarts the entire current round from the beginning.\n\nThe beat clock is restored to the full beat budget and the stage pipeline is rebuilt from scratch.\n\nUse this to grant the group a complete redo of the round.'
+}
+
 // ── Component ────────────────────────────────────────────────────────────────
 
-export function GmControls(): JSX.Element {
+interface GmControlsProps {
+  onBattleLogOpen?: () => void
+}
+
+export function GmControls({ onBattleLogOpen }: GmControlsProps): JSX.Element {
   const [tc, setTc] = useState<TCStatePayload | null>(null)
   const [gmHoldDismissed, setGmHoldDismissed] = useState(false)
 
@@ -121,11 +133,16 @@ export function GmControls(): JSX.Element {
   const canPause       = (isActive && currentStage?.type !== 'gm-release') || isSpin
   const canResume      = isPaused || isSpinPaused
 
-  // Stage Reset: restarts current stage. Available in stageActive or stageSpin only.
-  const canStageReset  = (isActive || isSpin) && inCombat
+  // Stage Reset: restarts current stage. Available in active countdown, paused, and spin modes.
+  const canStageReset  = (isActive || isPaused || isSpin || isSpinPaused) && inCombat
 
-  // Tier Reset: restarts entire Action Tier. Only available when on a tier stage (has tierIndex).
-  const canTierReset   = canStageReset && currentStage?.tierIndex !== undefined
+  // Tier Reset: available on any tier stage in active/paused/spin modes, plus stageGMHold
+  // when not on the first stage of the tier (only Response's hold qualifies in standard pipeline).
+  const canTierReset   = currentStage?.tierIndex !== undefined && inCombat &&
+    (isActive || isPaused || isSpin || isSpinPaused || (isGMHold && currentStage?.type !== 'action'))
+
+  // Round Reset: available in any GM hold that is not the very first stage of the round.
+  const canRoundReset  = isGMHold && (tc?.currentStageIndex ?? 0) > 0
 
   const canEndBattle   = !isIdle && !isBattleEnded
   const canReset       = true
@@ -241,6 +258,16 @@ export function GmControls(): JSX.Element {
           </Tooltip>
         )}
 
+        <Tooltip label="Opens the battle beat log — a timeline of stage starts, releases, and passes with beat positions." {...tipProps}>
+          <Button
+            leftSection={<IconClipboardList size={16} />}
+            variant="outline"
+            onClick={() => onBattleLogOpen?.()}
+          >
+            Battle Log
+          </Button>
+        </Tooltip>
+
         {showRelease && (
           // Wrap in Box so the tooltip still renders even when the button is disabled
           <Tooltip
@@ -321,8 +348,8 @@ export function GmControls(): JSX.Element {
         )}
       </Group>
 
-      {/* Reset controls — available during active stages to redo a stage or tier */}
-      {(canStageReset || canTierReset) && (
+      {/* Reset controls — redo a stage, tier, or entire round */}
+      {(canStageReset || canTierReset || canRoundReset) && (
         <>
           <Divider color="var(--tm-border)" />
           <Group gap="sm" wrap="wrap">
@@ -347,6 +374,18 @@ export function GmControls(): JSX.Element {
                   onClick={() => window.api.tierReset()}
                 >
                   Tier Reset
+                </Button>
+              </Tooltip>
+            )}
+            {canRoundReset && (
+              <Tooltip label={roundResetTooltip()} {...tipProps}>
+                <Button
+                  leftSection={<IconArrowBackUpDouble size={16} />}
+                  color="red"
+                  variant="outline"
+                  onClick={() => window.api.roundReset()}
+                >
+                  Round Reset
                 </Button>
               </Tooltip>
             )}

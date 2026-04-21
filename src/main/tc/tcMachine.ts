@@ -73,8 +73,20 @@ export interface TCContext {
   spinSecondsRemaining: number
   backgroundOpsComplete: boolean   // true when stage background operations are done
   beatsRemaining: number
-  beatsAtStageEntry: number        // beatsRemaining captured when the current stage was entered
-  beatsAtTierEntry: number         // beatsRemaining captured when the current tier's Action stage was entered
+  /**
+   * beatsRemaining at the moment the current stage was entered (set in checkAdvance).
+   *
+   * INVARIANT: Must never be mutated mid-stage. It is the fixed reference point for:
+   *   - Surplus carry-forward: surplusBeats = beatsRemaining − (beatsAtStageEntry − stage.beats)
+   *   - Stage Reset beat restoration: machine restores beatsRemaining to this value
+   *   - PASS beat charging: beatsRemaining = max(0, beatsAtStageEntry − stage.beats)
+   *
+   * If beatsAtStageEntry were changed mid-stage (e.g. by a difficulty adjustment), the surplus
+   * formula would produce an incorrect carry-forward, charging beats that were already consumed
+   * or crediting beats that were never in the budget. Treat as read-only after stage entry.
+   */
+  beatsAtStageEntry: number
+  beatsAtTierEntry: number         // beatsRemaining at the moment the current tier's Action stage was entered; used by TIER_RESET
   totalBeats: number               // beatsPerTC from the plugin (e.g. 60)
   /**
    * Beat/timer allocations of the current tier's Action and Response stages, snapshotted
@@ -106,15 +118,22 @@ export type TCEvent =
    * Restarts the current stage from its beginning.
    * Beat clock restored to beatsAtStageEntry. Any carry-forward already applied to this
    * stage's beat allocation is preserved. Machine returns to stageGMHold.
-   * Available in stageActive and stageSpin only (not during GM hold or paused states).
+   * Available in stageActive, stagePaused, stageSpin, and stageSpinPaused.
    */
   | { type: 'STAGE_RESET' }
   /**
    * Restarts the entire current Action Tier from its opening Action stage.
    * Beat clock restored to beatsAtTierEntry. Machine returns to stageGMHold for the
-   * tier's Action stage. Only available when current stage has a tierIndex.
+   * tier's Action stage. Available for tier stages in stageActive, stagePaused,
+   * stageSpin, stageSpinPaused, and stageGMHold (when not the first stage of the tier).
    */
   | { type: 'TIER_RESET' }
+  /**
+   * Restarts the entire current round from stage 0.
+   * Beat clock restored to totalBeats; stage pipeline rebuilt from scratch for this round.
+   * Available in stageGMHold when currentStageIndex > 0 (i.e., not the very first stage).
+   */
+  | { type: 'ROUND_RESET'; stages: StageDefinition[] }
   | { type: 'NEXT_ROUND'; stages: StageDefinition[] }
   | { type: 'END_BATTLE' }
   | { type: 'RESET' }
@@ -189,6 +208,27 @@ function beatsAfterStageComplete(context: TCContext): number {
   const stage = context.stages[context.currentStageIndex]
   return Math.max(0, context.beatsAtStageEntry - (stage?.beats ?? 0))
 }
+
+// ── Beat consumption at spin/advance entry ────────────────────────────────
+//
+// Three distinct beat accounting paths, each producing a different beatsRemaining:
+//
+//   Scenario          Function                  beatsRemaining formula
+//   ─────────────────────────────────────────────────────────────────────────────────
+//   Natural expiry    spinEntryAssign           beatsAtStageEntry − stage.beats
+//   (or 0-beat auto)  (full charge)             (full stage cost consumed)
+//
+//   GM Release        spinEntryAssignRelease    context.beatsRemaining (live value)
+//   (early end)       (partial charge)          (already decremented by TICK events;
+//                                                surplus = live − (entry − stage.beats))
+//
+//   GM Pass           spinEntryAssignPass       beatsAtStageEntry − stage.beats
+//   (skip from        (full charge)             (full cost even though timer never ran;
+//   stageActive)                                 the window existed in the timeline)
+//
+// Note: GM Pass from stageGMHold (not stageActive) costs the same full beat amount but
+// is applied inline in the PASS handler there (not via spinEntryAssignPass) because
+// GM Pass from hold does NOT enter spin — it goes directly to checkAdvance.
 
 /**
  * Assigns context for entering stageSpin from the current stage (natural or auto-advance).
@@ -400,7 +440,9 @@ export const tcMachine = createMachine({
           },
         ],
 
-        // Pause allowed for all stages except gm-release type.
+        // Pause allowed for all timed stages; excluded for gm-release (no meaningful timer to freeze).
+        // stageGMHold is also excluded by design — it has no PAUSE handler at all (see state comment).
+        // IMPORTANT: this guard must stay in sync with the canPause boolean in GmControls.tsx.
         PAUSE: {
           guard: ({ context }) => {
             const stage = context.stages[context.currentStageIndex]
@@ -478,11 +520,22 @@ export const tcMachine = createMachine({
       },
     },
 
-    // Transient: immediately decides whether to advance to next stage or end TC.
+    // ── checkAdvance — Transient routing state ────────────────────────────────
+    //
+    // XState v5 resolves 'always' transitions synchronously and immediately — checkAdvance
+    // is never truly "resting" in this state; it passes through in the same microtask.
+    // The subscriber in index.ts MUST skip checkAdvance explicitly (it checks for it by name)
+    // to prevent hook dispatch, ledger writes, and broadcast from firing on the transient
+    // intermediate state before XState settles on the real target (stageGMHold, stageActive,
+    // or tcComplete). Without the skip, prevMachineState would be contaminated with
+    // 'checkAdvance' rather than the actual prior stable state, breaking all downstream
+    // transition detection logic.
+    //
     // beatsRemaining is NOT recomputed here — it is already correct from the previous stage's
     // exit assignment (natural expiry → full beats charged; GM Release → partial; GM Pass → full cost).
     // action/response stages enter stageGMHold first (GM prep phase before timer starts).
-    // When entering the Action stage of an Action Tier, beatsAtTierEntry is captured.
+    // When entering the Action stage of an Action Tier, beatsAtTierEntry and tierStageSnapshot
+    // are captured here (see tier-entry assign block below).
     checkAdvance: {
       always: [
         {
@@ -554,12 +607,34 @@ export const tcMachine = createMachine({
     },
 
     /**
-     * GM Hold state: action/response stages enter here before the player countdown starts.
-     * The GM uses this window to plan NPC actions/responses before opening the player timer.
-     * Timer does not run; beats do not tick. No pause allowed (serves no purpose with no timer).
+     * GM Hold state — GM prep phase before the player countdown begins.
      *
-     * GM Release → stageActive  (starts the player countdown and beat burndown)
-     * GM Pass    → checkAdvance (skips stage entirely; zero beats; no spin — timer never started)
+     * Design rationale:
+     *   TacticalMelee requires all players AND all NPCs to act simultaneously within a shared
+     *   countdown window. Players can see the timer and react in real time. The GM, however,
+     *   controls multiple NPCs with complex interactions and cannot realistically plan all NPC
+     *   actions in the same compressed window that players have. Without a dedicated prep phase,
+     *   the GM would constantly be asking for more time, defeating the purpose of the countdown.
+     *
+     *   stageGMHold gives the GM unlimited prep time before the player clock opens. The HUD
+     *   displays "GM is preparing" so players know to wait. When the GM is ready, GM Release
+     *   starts the countdown for everyone simultaneously.
+     *
+     * Mechanics:
+     *   - Entered from checkAdvance for action and response stage types (isGMHoldStageType guard).
+     *   - Timer is frozen (timerSecondsRemaining = 0); beats do not tick; burndown does not move.
+     *   - Pause is not available in this state — there is no running timer to pause.
+     *   - Only action and response stages enter GM Hold; all other types skip directly to stageActive.
+     *
+     * Transitions:
+     *   GM Release → stageActive  (sets timerSecondsRemaining; starts player countdown + beat burn)
+     *   GM Pass    → checkAdvance (skips the stage; full beat cost charged; no spin)
+     *   TIER_RESET → stageGMHold  (Response hold only; backs up to Action hold; restores tier beats)
+     *   ROUND_RESET → checkAdvance → stageActive/stageGMHold at index 0 (rebuilds from round start)
+     *
+     * Note on pause in stageGMHold: explicitly omitted by design. With no timer running, pausing
+     * has no mechanical effect. This is enforced in GmControls.tsx (canPause excludes isGMHold)
+     * and the machine simply has no PAUSE handler in this state.
      */
     stageGMHold: {
       on: {
@@ -601,10 +676,14 @@ export const tcMachine = createMachine({
             const newStages = event.stages
             const snap = context.tierStageSnapshot
             if (!snap) return { stages: newStages }
-            // Refresh only Action and Response entries — Response retains its current
-            // snapshot value (base, pre-intra-tier-carry) unless the pipeline update
-            // actually changed it. At tier entry no intra-tier carry has occurred yet,
-            // so newStages[responseIdx].beats will still be the base value here.
+            // Refresh only Action and Response entries in the snapshot from the new stages.
+            // "Current snapshot value" = the tier-entry base captured when we first entered
+            // the tier in checkAdvance — before any intra-tier carry (Action surplus → Response)
+            // has been applied. At tier entry (the typical case for arriving here) no intra-tier
+            // carry has occurred yet, so newStages[responseIdx].beats is still the base value
+            // and the snapshot update is a no-op for Response. This handles deferred cross-tier
+            // carry (from a previous tier's Resolution spin completing), which may update Action
+            // but not Response — we still want the snapshot to reflect the new Action allocation.
             const updatedSnap: TierStageSnapshot = {
               ...snap,
               actionBeats:         newStages[snap.actionIndex]?.beats         ?? snap.actionBeats,
@@ -614,6 +693,62 @@ export const tcMachine = createMachine({
             }
             return { stages: newStages, tierStageSnapshot: updatedSnap }
           }),
+        },
+
+        // Tier Reset from Response stageGMHold: back up to the tier's Action stage.
+        // Guard: stage must be a tier stage AND not the first stage in the tier (action).
+        // Only Response qualifies in the standard pipeline — Action's GM hold is the entry point.
+        TIER_RESET: {
+          guard: ({ context }) => {
+            const stage = context.stages[context.currentStageIndex]
+            return !!stage && stage.tierIndex !== undefined && stage.type !== 'action'
+          },
+          target: 'stageGMHold',
+          actions: assign(({ context }) => {
+            const stage = context.stages[context.currentStageIndex]
+            const actionIndex = findTierActionIndex(context.stages, stage.tierIndex!)
+            const snap = context.tierStageSnapshot
+            const stages = snap
+              ? context.stages.map((s, i) => {
+                  if (i === snap.actionIndex) {
+                    return { ...s, beats: snap.actionBeats, ...(snap.actionTimerSeconds > 0 ? { timerSeconds: snap.actionTimerSeconds } : {}) }
+                  }
+                  if (i === snap.responseIndex) {
+                    return { ...s, beats: snap.responseBeats, ...(snap.responseTimerSeconds > 0 ? { timerSeconds: snap.responseTimerSeconds } : {}) }
+                  }
+                  return s
+                })
+              : context.stages
+            return {
+              currentStageIndex: actionIndex >= 0 ? actionIndex : context.currentStageIndex,
+              timerSecondsRemaining: 0,
+              spinSecondsRemaining: 0,
+              beatsRemaining: context.beatsAtTierEntry,
+              beatsAtStageEntry: context.beatsAtTierEntry,
+              stages,
+            }
+          }),
+        },
+
+        // Round Reset: restarts the entire round from stage 0.
+        // Beat clock restored to totalBeats; fresh pipeline provided via event.
+        // Guard: not the very first stage of the round (currentStageIndex > 0).
+        // Targets checkAdvance with currentStageIndex = -1 so checkAdvance advances to 0,
+        // routing to stageGMHold or stageActive depending on stage 0's type.
+        ROUND_RESET: {
+          guard: ({ context }) => context.currentStageIndex > 0,
+          target: 'checkAdvance',
+          actions: assign(({ context, event }) => ({
+            stages: event.stages,
+            currentStageIndex: -1,
+            timerSecondsRemaining: 0,
+            spinSecondsRemaining: 0,
+            backgroundOpsComplete: true,
+            beatsRemaining: context.totalBeats,
+            beatsAtStageEntry: context.totalBeats,
+            beatsAtTierEntry: 0,
+            tierStageSnapshot: null,
+          })),
         },
 
         END_BATTLE: { target: 'battleEnded' },
@@ -747,15 +882,126 @@ export const tcMachine = createMachine({
     stageSpinPaused: {
       on: {
         RESUME:          { target: 'stageSpin' },
+
+        STAGE_RESET: {
+          target: 'stageGMHold',
+          actions: assign(({ context }) => {
+            const currentStage = context.stages[context.currentStageIndex]
+            const snap = context.tierStageSnapshot
+            const stages = snap && currentStage?.type === 'action'
+              ? context.stages.map((s, i) => {
+                  if (i !== snap.responseIndex) return s
+                  return {
+                    ...s,
+                    beats: snap.responseBeats,
+                    ...(snap.responseTimerSeconds > 0 ? { timerSeconds: snap.responseTimerSeconds } : {}),
+                  }
+                })
+              : context.stages
+            return { timerSecondsRemaining: 0, spinSecondsRemaining: 0, beatsRemaining: context.beatsAtStageEntry, stages }
+          }),
+        },
+
+        TIER_RESET: {
+          guard: ({ context }) => {
+            const stage = context.stages[context.currentStageIndex]
+            return !!stage && stage.tierIndex !== undefined
+          },
+          target: 'stageGMHold',
+          actions: assign(({ context }) => {
+            const stage = context.stages[context.currentStageIndex]
+            const actionIndex = findTierActionIndex(context.stages, stage.tierIndex!)
+            const snap = context.tierStageSnapshot
+            const stages = snap
+              ? context.stages.map((s, i) => {
+                  if (i === snap.actionIndex) {
+                    return { ...s, beats: snap.actionBeats, ...(snap.actionTimerSeconds > 0 ? { timerSeconds: snap.actionTimerSeconds } : {}) }
+                  }
+                  if (i === snap.responseIndex) {
+                    return { ...s, beats: snap.responseBeats, ...(snap.responseTimerSeconds > 0 ? { timerSeconds: snap.responseTimerSeconds } : {}) }
+                  }
+                  return s
+                })
+              : context.stages
+            return {
+              currentStageIndex: actionIndex >= 0 ? actionIndex : context.currentStageIndex,
+              timerSecondsRemaining: 0,
+              spinSecondsRemaining: 0,
+              beatsRemaining: context.beatsAtTierEntry,
+              beatsAtStageEntry: context.beatsAtTierEntry,
+              stages,
+            }
+          }),
+        },
+
         UPDATE_PIPELINE: { actions: assign({ stages: ({ event }) => event.stages }) },
         END_BATTLE:      { target: 'battleEnded' },
         RESET:           { target: 'idle', actions: assign(RESET_CONTEXT) },
       },
     },
 
+    /**
+     * Active-stage paused state: the countdown timer is frozen at its current value.
+     * The external TICK interval is stopped while this state is active.
+     * Resumes back into stageActive (timer continues from where it was frozen).
+     * STAGE_RESET and TIER_RESET are available here (same logic as stageActive).
+     * PAUSE arrives from stageActive on any timed stage (gm-release and stageGMHold excluded).
+     */
     stagePaused: {
       on: {
         RESUME:          { target: 'stageActive' },
+
+        STAGE_RESET: {
+          target: 'stageGMHold',
+          actions: assign(({ context }) => {
+            const currentStage = context.stages[context.currentStageIndex]
+            const snap = context.tierStageSnapshot
+            const stages = snap && currentStage?.type === 'action'
+              ? context.stages.map((s, i) => {
+                  if (i !== snap.responseIndex) return s
+                  return {
+                    ...s,
+                    beats: snap.responseBeats,
+                    ...(snap.responseTimerSeconds > 0 ? { timerSeconds: snap.responseTimerSeconds } : {}),
+                  }
+                })
+              : context.stages
+            return { timerSecondsRemaining: 0, spinSecondsRemaining: 0, beatsRemaining: context.beatsAtStageEntry, stages }
+          }),
+        },
+
+        TIER_RESET: {
+          guard: ({ context }) => {
+            const stage = context.stages[context.currentStageIndex]
+            return !!stage && stage.tierIndex !== undefined
+          },
+          target: 'stageGMHold',
+          actions: assign(({ context }) => {
+            const stage = context.stages[context.currentStageIndex]
+            const actionIndex = findTierActionIndex(context.stages, stage.tierIndex!)
+            const snap = context.tierStageSnapshot
+            const stages = snap
+              ? context.stages.map((s, i) => {
+                  if (i === snap.actionIndex) {
+                    return { ...s, beats: snap.actionBeats, ...(snap.actionTimerSeconds > 0 ? { timerSeconds: snap.actionTimerSeconds } : {}) }
+                  }
+                  if (i === snap.responseIndex) {
+                    return { ...s, beats: snap.responseBeats, ...(snap.responseTimerSeconds > 0 ? { timerSeconds: snap.responseTimerSeconds } : {}) }
+                  }
+                  return s
+                })
+              : context.stages
+            return {
+              currentStageIndex: actionIndex >= 0 ? actionIndex : context.currentStageIndex,
+              timerSecondsRemaining: 0,
+              spinSecondsRemaining: 0,
+              beatsRemaining: context.beatsAtTierEntry,
+              beatsAtStageEntry: context.beatsAtTierEntry,
+              stages,
+            }
+          }),
+        },
+
         UPDATE_PIPELINE: { actions: assign({ stages: ({ event }) => event.stages }) },
         END_BATTLE:      { target: 'battleEnded' },
         RESET:           { target: 'idle', actions: assign(RESET_CONTEXT) },

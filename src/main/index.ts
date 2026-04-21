@@ -1,3 +1,46 @@
+// ── TacticalMelee — Main Process Entry Point ──────────────────────────────────
+//
+// This file is the central coordinator of the entire application. It owns:
+//   - The XState machine actor (tcActor) — the single source of truth for all game state
+//   - The subscription that reacts to every state transition (hook dispatch, beat math, broadcast)
+//   - All IPC handlers that receive GM actions from the renderer (GM Dashboard)
+//   - BattleLedger management for beat log history and Memento-based reset rollback
+//   - StagePlanner invocations for pipeline expansion and carry-forward redistribution
+//   - Broadcasting state to both surfaces: IPC → GM Dashboard, WebSocket → Group HUD
+//
+// ── Data flow overview ────────────────────────────────────────────────────────
+//
+//   GM action (button click in renderer)
+//     → window.api.* (preload/index.ts: contextBridge)
+//     → ipcRenderer.send('tc:...')
+//     → ipcMain.on('tc:...') handler in this file
+//     → tcActor.send({ type: 'EVENT' })
+//     → XState machine transition (tcMachine.ts)
+//     → tcActor.subscribe fires synchronously
+//     → hook dispatch (StageRegistry), beat math, BattleLedger, StagePlanner carry-forward
+//     → broadcast: ipcMain → renderer ('tc:state-update') AND lanServer.broadcast (WebSocket)
+//     → GM Dashboard (renderer/src/App.tsx via onStateUpdate IPC listener)
+//     → Group HUD (hud/HudApp.tsx via WebSocket TC_STATE/LEDGER_STATE messages)
+//
+// ── Surface architecture ──────────────────────────────────────────────────────
+//
+//   GM Dashboard  — Electron renderer window, has IPC access via preload/index.ts.
+//                   Sends commands, receives TC_STATE and LEDGER_STATE via IPC.
+//   Group HUD     — Second BrowserWindow, NO preload (no IPC access by design).
+//                   Read-only: receives TC_STATE and LEDGER_STATE via WebSocket (port 3001).
+//                   Can be opened on a separate screen / separate LAN device.
+//   Player HUDs   — Future: same WebSocket pattern as Group HUD, per-player state filtering.
+//
+// ── Key subsystems ────────────────────────────────────────────────────────────
+//
+//   tcMachine.ts          — XState machine: all states, transitions, beat math, guards, actions
+//   stagePlanner.ts       — Pipeline expansion (triad repeat) and carry-forward redistribution
+//   BattleLedger.ts       — Memento stack for beat log + rollback on Stage/Tier/Round Reset
+//   roundVisibilityUtils  — DSL evaluator: which stages are active for a given round number
+//   StageRegistry         — Plugin hook dispatch (onEnter / onTick / onExit per stage type)
+//   lanServer.ts          — WebSocket + HTTP server for Group HUD and future player clients
+//   ActivePlugin.ts       — Hardcoded Standard plugin config (beat budget, stage definitions)
+
 import { app, shell, BrowserWindow, session, ipcMain } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
@@ -8,6 +51,7 @@ import { createLanServer, LAN_PORT } from './server/lanServer'
 import { StageRegistry } from './stages/registry'
 import { StagePlanner } from './stages/stagePlanner'
 import { filterStagesForRound, validateStagesRoundVisibility } from './stages/roundVisibilityUtils'
+import { BattleLedger } from './battle/BattleLedger'
 import { logger } from './logger'
 import type { TCStatePayload } from '../shared/types'
 import { isTimedStageType } from '../shared/types'
@@ -25,6 +69,10 @@ const lanServer     = createLanServer()
 // for the lifetime of the app (plugin config does not change at runtime).
 const stagePlanner  = new StagePlanner(activePlugin.getConfig().minAdjustedTimerSeconds)
 
+// BattleLedger tracks beat log history with a Memento snapshot stack so that
+// Stage Reset and Tier Reset can roll the log back consistently with the machine.
+const battleLedger = new BattleLedger()
+
 let tickInterval:     ReturnType<typeof setInterval> | null = null
 let spinTickInterval: ReturnType<typeof setInterval> | null = null
 
@@ -32,12 +80,63 @@ let spinTickInterval: ReturnType<typeof setInterval> | null = null
 let prevMachineState: string | null = null
 let prevStageIndex: number = -1
 
+// Set to 'pass' in the tc:pass IPC handler before sending the PASS event.
+// The subscription reads this flag to avoid logging a duplicate exit entry when
+// a PASS from stageActive causes a stageActive → stageSpin transition (which the
+// subscription would otherwise log as 'time-expired'). Cleared after tcActor.send().
+// lastIpcOp — synchronous IPC→subscription coordination flag.
+//
+// XState v5 processes events synchronously: the subscription fires (and completes) inside
+// tcActor.send() before send() returns. This means a flag set immediately before send() is
+// visible to the subscription during that same call stack, and cleared after send() returns.
+//
+// This property is exploited in two places:
+//   'pass'        — tells the subscription not to log a duplicate exit entry when PASS causes
+//                   stageActive → stageSpin (the IPC handler already logged the gm-pass entry)
+//   'round-reset' — tells the subscription that a stageGMHold → stageGMHold (lower index)
+//                   transition was caused by ROUND_RESET (IPC restored the ledger), not by
+//                   TIER_RESET from Response hold (which needs subscription-side restore)
+//
+// FRAGILITY NOTE: This pattern relies on XState v5 synchronous observable semantics.
+// If the codebase is ever upgraded to an async XState version, this flag becomes a race
+// condition. The safe alternative is to carry the metadata in the event itself
+// (e.g. { type: 'PASS', _source: 'ipc' }) but that would require adding fields to TCEvent.
+//
+// DECISION GUIDE — when adding a new IPC op, does it need a lastIpcOp flag?
+//   YES, if: the subscription would independently re-do something the IPC handler already did
+//            (e.g., restoring ledger state), or would misidentify the transition as a different
+//            event type (e.g., reset vs normal advance).
+//   NO,  if: the subscription's side-effects are correct regardless of which IPC op triggered
+//            the transition (e.g., a simple 'start' that just changes machine state normally).
+let lastIpcOp: 'pass' | 'round-reset' | null = null
+
 // Holds a Response stage's surplus beats that should carry forward to the next tier's
 // Action, but are deferred until the current tier's Resolution spin completes.
-// Deferral ensures Tier Reset (available through Response, not after Resolution) and
-// cross-tier carry are mutually exclusive — no double-counting on reset.
-// Cleared when a Stage Reset or Tier Reset is detected.
+//
+// Carry-forward timing windows — three zones with different rules:
+//
+//   Zone 1 — Intra-tier (Action/Pre-Encounter → Response/Action-Tier1):
+//     Applied IMMEDIATELY in the subscription when the source stage exits.
+//     Safe: no reset can undo a stage that is already complete.
+//
+//   Zone 2 — Cross-tier carry (Response → next Action), PENDING phase:
+//     Response exits early → surplus stored in pendingCrossTierCarry.
+//     ↓ Resolution stageSpin is active here.
+//     DANGER ZONE: Tier Reset is still available (from stageSpin/stageSpinPaused).
+//     Applying carry now + Tier Reset = double-counting. Do NOT apply yet.
+//
+//   Zone 3 — Cross-tier carry, SAFE to apply:
+//     Resolution spin completes → machine advances to next tier's stageGMHold.
+//     Tier Reset for the completed tier is now impossible (machine is past it).
+//     pendingCrossTierCarry is consumed and UPDATE_PIPELINE is sent.
+//
+//   Zone 4 — Reset fired during Zone 2:
+//     Tier/Stage Reset detected → pendingCrossTierCarry is discarded.
+//     The tier replays from scratch; the surplus never existed for the new run.
+//
+// Cleared when: Stage Reset detected, Tier Reset detected, Round Reset (in IPC handler).
 let pendingCrossTierCarry: { fromStageIndex: number; surplusBeats: number } | null = null
+
 
 // ── Timer management ─────────────────────────────────────────────────────────
 
@@ -60,6 +159,15 @@ function devLog(message: string): void {
   if (is.dev) {
     mainWindow?.webContents.send('tm:dev-log', message)
   }
+}
+
+// ── Battle Ledger broadcast ───────────────────────────────────────────────
+// Sends the current ledger payload to both the GM Dashboard (IPC) and the
+// Group HUD (WebSocket), keeping both surfaces in sync with every update.
+function broadcastLedger(): void {
+  const data = battleLedger.getData()
+  mainWindow?.webContents.send('ledger:update', data)
+  lanServer.broadcast({ type: 'LEDGER_STATE', payload: data })
 }
 
 // ── GM Alert ────────────────────────────────────────────────────────────────
@@ -87,11 +195,43 @@ function stopTicker(): void {
 }
 
 // ── XState subscription ─────────────────────────────────────────────────────
+//
+// This is the heart of the main process. It fires synchronously on every state
+// transition and performs ALL side-effects in a fixed order:
+//
+//   1. Guard: skip transient checkAdvance (see comment below)
+//   2. Hook dispatch  — onEnter / onTick / onExit via StageRegistry
+//   3. BattleLedger   — push stage/tier snapshot on entry; log beat events; restore on reset
+//   4. StagePlanner   — detect GM Release surplus; apply carry-forward via UPDATE_PIPELINE
+//   5. Reset detection — clear pendingCrossTierCarry; detect Tier/Stage/Round Reset paths
+//   6. Deferred carry — apply cross-tier carry when Resolution spin advances forward
+//   7. Ledger discard — remove stale snapshots on normal forward completion
+//   8. Tier push      — snapshot new tier on entering Action stageGMHold
+//   9. Stack cleanup  — discard on TC complete or battle end
+//  10. Timer mgmt     — start/stop TICK and SPIN_TICK intervals based on new state
+//  11. Broadcast      — send TCStatePayload via IPC (GM Dashboard) + WebSocket (Group HUD)
+//
+// Steps 3–8 are interleaved with state-transition detection using prevMachineState /
+// prevStageIndex shadows updated at step 11 (end of subscription body).
+// Steps 1–11 complete entirely before tcActor.send() returns (XState v5 is synchronous).
 
 tcActor.subscribe((snapshot) => {
   const state = String(snapshot.value)
 
-  // Skip the transient checkAdvance state — it resolves immediately
+  // Skip the transient checkAdvance pseudo-state.
+  //
+  // checkAdvance uses XState `always` transitions — it resolves to the next stable state
+  // in the same synchronous microtask. XState v5 fires the subscription for every state,
+  // including transient ones, so without this guard the subscription would fire twice:
+  // once with state='checkAdvance' and once with the real target state.
+  //
+  // The critical problem is prevMachineState: if we processed checkAdvance, prevMachineState
+  // would be set to 'checkAdvance' before the real state arrives. Every downstream comparison
+  // (e.g. `prevMachineState === 'stageActive'` for reset detection) would then fail because
+  // the last recorded state was 'checkAdvance', not the real prior state.
+  //
+  // By returning early here, prevMachineState always reflects the last *stable* state,
+  // keeping all transition comparisons in the subscription logically correct.
   if (state === 'checkAdvance') return
 
   const { stages, currentStageIndex } = snapshot.context
@@ -117,10 +257,19 @@ tcActor.subscribe((snapshot) => {
     prevMachineState === 'stageActive' &&
     prevStageIndex === currentStageIndex
 
+  // Error contract: hook handlers (onEnter/onTick/onExit) are currently all stubs that
+  // return void synchronously. If a future handler throws, the exception propagates up
+  // through the subscription and would crash the main process. When non-trivial handler
+  // logic is introduced, wrap with try/catch and send a 'tm:gm-alert' to surface errors
+  // without bringing down the machine loop. For now, no wrapping needed — stubs cannot throw.
   if (exiting && prevStageIndex >= 0) {
     const prevStage = stages[prevStageIndex]
     if (prevStage) {
       const handler = StageRegistry[prevStage.type]
+      // Missing handler: silently skipped. This is intentional — stub handlers return
+      // no-ops but are always registered. If a new stage type is added to the plugin
+      // without a corresponding registry entry, the miss is silent. Add a logger.warn
+      // here if you need to surface misconfiguration during development.
       if (handler) {
         devLog(`[Stage:${prevStage.type}] onExit — "${prevStage.name}" (round ${snapshot.context.round})`)
         handler.onExit(prevStage, snapshot.context)
@@ -141,6 +290,51 @@ tcActor.subscribe((snapshot) => {
     if (handler) {
       devLog(`[Stage:${currentStage.type}] onTick — "${currentStage.name}" (round ${snapshot.context.round}, ${snapshot.context.timerSecondsRemaining}s remaining)`)
       handler.onTick(currentStage, snapshot.context)
+    }
+  }
+
+  // ── BattleLedger — entering stageActive ───────────────────────────────────
+  //
+  // Push stage snapshot and log stage-start for every stageActive entry.
+  // 0-beat stages: snapshot IS pushed (for reset consistency) but stage-start is NOT logged.
+  //
+  // Why 0-beat stages are excluded from the beat log:
+  //   The beat log is a timeline of in-world time consumption — it answers "when did this
+  //   happen in the tactical cycle?" 0-beat system stages (Surprise, Initiative, Resolution)
+  //   consume no in-world time; they are computation windows outside of time. Logging them
+  //   would produce misleading "0.0 beats consumed" entries that pollute the timeline.
+  //   The snapshot is still pushed so that Stage Reset from a system stage works correctly
+  //   (the machine returns to stageGMHold and the ledger restores consistently).
+  //   If you add a stage type that is 0-beat but meaningful to log, add an explicit
+  //   override here rather than relaxing the beats > 0 rule globally.
+  //
+  // Two entry paths:
+  //   entering = true  → new stage index (preamble, system, or first entry from idle)
+  //   releasingFromHold → stageGMHold → stageActive on the SAME stage index
+  //                       (GM Release from hold for Action/Response).
+  //                       The 'entering' flag is false here since both stageGMHold
+  //                       and stageActive are "in-stage" at the same index, but this
+  //                       IS the moment the countdown timer starts.
+
+  const releasingFromHold = state === 'stageActive' &&
+    prevMachineState === 'stageGMHold' &&
+    currentStageIndex === prevStageIndex
+
+  // stagePaused → stageActive is a resume, not a new entry — wasInStage is false
+  // for stagePaused so entering=true fires incorrectly; exclude it explicitly.
+  const resumingFromPause = state === 'stageActive' && prevMachineState === 'stagePaused'
+
+  if (((entering && state === 'stageActive') || releasingFromHold) && !resumingFromPause) {
+    battleLedger.push('stage')
+    if (currentStage && currentStage.beats > 0) {
+      battleLedger.logEntry({
+        round: snapshot.context.round,
+        tierIndex: currentStage.tierIndex,
+        stageId: currentStage.id,
+        stageName: currentStage.name,
+        operation: 'stage-start',
+        beatsConsumed: snapshot.context.totalBeats - snapshot.context.beatsRemaining,
+      })
     }
   }
 
@@ -165,9 +359,49 @@ tcActor.subscribe((snapshot) => {
   //     mutually exclusive — the reset window closes before the carry is applied.
   //   All other timed stages (Action, Pre-Encounter, Morale) → intra-tier or
   //     same-round carry. Applied IMMEDIATELY via UPDATE_PIPELINE.
+  //
+  // Why Response carry-forward is deferred (double-counting problem):
+  //
+  //   Scenario without deferral:
+  //     1. Response releases early → surplusBeats = 2 → UPDATE_PIPELINE applied immediately,
+  //        inflating next-tier Action from 4b to 6b.
+  //     2. GM triggers Tier Reset from Resolution spin.
+  //     3. Machine restores beatsAtTierEntry (e.g. 40b) as the beat clock.
+  //     4. BUT the pipeline still has Action at 6b (the carry was already applied).
+  //     5. On the next real advance, another carry detection fires against the 6b allocation,
+  //        potentially carrying surplus from the now-inflated allocation → double-count.
+  //
+  //   Solution: defer until Resolution spin completes. After Resolution spin → next tier's
+  //   Action stageGMHold, Tier Reset is no longer possible for the completed tier (the window
+  //   has closed). The carry is then applied atomically to a pipeline that cannot be rolled back.
+  //   The carry and the Tier Reset window are made mutually exclusive in time.
 
-  if (prevMachineState === 'stageActive' && state === 'stageSpin') {
+  if ((prevMachineState === 'stageActive' || prevMachineState === 'stagePaused') && state === 'stageSpin') {
     const prevStage = stages[prevStageIndex]
+
+    // BattleLedger: log stage end and discard the stage snapshot.
+    // Covers stageActive → stageSpin (normal end or early release) and
+    // stagePaused → stageSpin (PASS while paused).
+    //
+    // Skip the exit log when lastIpcOp === 'pass' — the IPC handler already
+    // logged a 'gm-pass' entry before sending the event; logging here too
+    // would produce a duplicate entry.
+    if (prevStage && prevStage.beats > 0 && lastIpcOp !== 'pass') {
+      // Determine whether the stage ended early (GM Release with surplus beats)
+      // or ran to full time (natural expiry, no surplus).
+      const fullCostRemaining = snapshot.context.beatsAtStageEntry - prevStage.beats
+      const surplusForLog = snapshot.context.beatsRemaining - fullCostRemaining
+      battleLedger.logEntry({
+        round: snapshot.context.round,
+        tierIndex: prevStage.tierIndex,
+        stageId: prevStage.id,
+        stageName: prevStage.name,
+        operation: surplusForLog > 0.05 ? 'gm-release' : 'time-expired',
+        beatsConsumed: snapshot.context.totalBeats - snapshot.context.beatsRemaining,
+      })
+    }
+    battleLedger.discard('stage')
+
     if (prevStage && prevStage.beats > 0 && isTimedStageType(prevStage.type)) {
       const fullCostRemaining = snapshot.context.beatsAtStageEntry - prevStage.beats
       const surplusBeats = snapshot.context.beatsRemaining - fullCostRemaining
@@ -192,20 +426,38 @@ tcActor.subscribe((snapshot) => {
 
   // ── Reset detection — clear pending cross-tier carry ─────────────────────
   //
-  // Stage Reset and Tier Reset are visible as:
-  //   stageActive → stageGMHold     (always a reset — normal exits never go there directly)
-  //   stageSpin   → stageGMHold with currentStageIndex ≤ prevStageIndex (backward/same = reset)
+  // Reset truth table — (prevState, currState, index direction, lastIpcOp) → type:
   //
-  // Normal forward advance: stageSpin → stageGMHold with currentStageIndex > prevStageIndex.
+  //   prevState          currState    index vs prev   lastIpcOp    → event type
+  //   ─────────────────  ──────────── ─────────────── ──────────── ────────────────────────
+  //   stageActive        stageGMHold  same            —            Stage Reset
+  //   stageActive        stageGMHold  lower           —            Tier Reset
+  //   stagePaused        stageGMHold  same            —            Stage Reset (paused → hold)
+  //   stagePaused        stageGMHold  lower           —            Tier Reset  (paused → hold)
+  //   stageSpin          stageGMHold  same            —            Stage Reset from spin
+  //   stageSpin          stageGMHold  lower           —            Tier Reset  from spin
+  //   stageSpinPaused    stageGMHold  same            —            Stage Reset from spin-paused
+  //   stageSpinPaused    stageGMHold  lower           —            Tier Reset  from spin-paused
+  //   stageGMHold        stageGMHold  lower           —            Tier Reset  from Response hold
+  //   stageGMHold        checkAdvance lower           'round-reset' Round Reset (IPC handled ledger)
   //
-  // When a reset fires while pendingCrossTierCarry is set (e.g. Response released early,
-  // then Tier Reset from Resolution spin), the pending carry is simply discarded — the
-  // tier is replaying from the start and the surplus beats are forfeited.
+  //   stageSpin          stageGMHold  HIGHER          —            NORMAL forward advance (not reset!)
+  //   any                any          same or higher  —            Normal transition — not a reset
+  //
+  // Round Reset: pendingCrossTierCarry was already cleared in the IPC handler. The ledger
+  // was restored there before tcActor.send(), using lastIpcOp = 'round-reset' to distinguish
+  // it from a Tier Reset from Response hold (which shares the same state transition shape).
+  //
+  // Pending carry discard: if a reset fires while pendingCrossTierCarry is set (Response
+  // released early, then Tier Reset from Resolution spin), the carry is forfeited — the
+  // tier will re-run from scratch and the surplus never existed as far as the new run is concerned.
 
   if (
     state === 'stageGMHold' &&
     (prevMachineState === 'stageActive' ||
-      (prevMachineState === 'stageSpin' && currentStageIndex <= prevStageIndex))
+      prevMachineState === 'stagePaused' ||
+      (prevMachineState === 'stageGMHold' && currentStageIndex < prevStageIndex && lastIpcOp !== 'round-reset') ||
+      ((prevMachineState === 'stageSpin' || prevMachineState === 'stageSpinPaused') && currentStageIndex <= prevStageIndex))
   ) {
     pendingCrossTierCarry = null
   }
@@ -230,6 +482,104 @@ tcActor.subscribe((snapshot) => {
     if (updatedStages !== stages) {
       tcActor.send({ type: 'UPDATE_PIPELINE', stages: updatedStages })
     }
+  }
+
+  // ── BattleLedger — snapshot restore on Stage Reset / Tier Reset ──────────
+  //
+  // stageActive → stageGMHold: always a reset (no normal exit goes directly there).
+  //   Same index  → Stage Reset: restore stage snapshot.
+  //   Lower index → Tier Reset: restore tier snapshot (which also discards stage above it).
+  //
+  // stagePaused → stageGMHold: same semantics as stageActive → stageGMHold.
+  //
+  // stageSpin / stageSpinPaused → stageGMHold backward/same: reset from spin.
+  //   Same index  → Stage Reset from spin.
+  //   Lower index → Tier Reset from spin.
+  //
+  // stageGMHold → stageGMHold (lower index, not round-reset): Tier Reset from Response hold.
+  //   Round Reset is excluded: IPC handler already restored the ledger before send().
+
+  if ((prevMachineState === 'stageActive' || prevMachineState === 'stagePaused') && state === 'stageGMHold') {
+    if (currentStageIndex < prevStageIndex) {
+      battleLedger.restore('tier')
+    } else {
+      battleLedger.restore('stage')
+    }
+  }
+
+  if ((prevMachineState === 'stageSpin' || prevMachineState === 'stageSpinPaused') && state === 'stageGMHold' && currentStageIndex <= prevStageIndex) {
+    if (currentStageIndex < prevStageIndex) {
+      battleLedger.restore('tier')
+    } else {
+      battleLedger.restore('stage')
+    }
+  }
+
+  if (prevMachineState === 'stageGMHold' && state === 'stageGMHold' && currentStageIndex < prevStageIndex && lastIpcOp !== 'round-reset') {
+    battleLedger.restore('tier')
+  }
+
+  // ── BattleLedger — snapshot discard on normal forward advance from spin ───
+  //
+  // Resolution spin → next tier: discard tier snapshot (tier completed normally).
+  // Any other spin → next stage: discard stage snapshot (stage completed normally).
+
+  if (prevMachineState === 'stageSpin' && state === 'stageGMHold' && currentStageIndex > prevStageIndex) {
+    if (stages[prevStageIndex]?.type === 'resolution') {
+      battleLedger.discard('tier')
+    } else {
+      battleLedger.discard('stage')
+    }
+  }
+
+  // ── BattleLedger — entering stageGMHold (tier push) ──────────────────────
+  //
+  // Push a tier snapshot when entering Action stageGMHold for a new tier.
+  //
+  // ORDERING INVARIANT: This push is placed AFTER the discard block.
+  //
+  // The collision scenario that forces this order:
+  //   Resolution spin completes → machine advances to next tier's Action stageGMHold.
+  //   In the subscription, this transition simultaneously satisfies BOTH:
+  //     a) "stageSpin → stageGMHold forward" → DISCARD old tier snapshot
+  //     b) "entering stageGMHold, type=action" → PUSH new tier snapshot
+  //
+  //   If push ran FIRST:
+  //     Stack before: [round, tier_old]
+  //     After push:   [round, tier_old, tier_new]   ← tier_new on top
+  //     After discard('tier'): removes the TOP 'tier' entry → removes tier_new (just pushed!)
+  //     Result: stack [round, tier_old] — new tier has no snapshot; Stage/Tier Reset would
+  //             restore to old tier's beat values. Silent corruption.
+  //
+  //   With discard FIRST:
+  //     Stack before: [round, tier_old]
+  //     After discard('tier'): [round]              ← tier_old removed
+  //     After push('tier'):    [round, tier_new]    ← correct
+  //
+  // Reset reentry detection (isResetReentry) prevents pushing a duplicate snapshot when
+  // returning to Action stageGMHold via Stage Reset, Tier Reset, or Round Reset — in those
+  // cases the restore block above has already handled the ledger state.
+
+  if (entering && state === 'stageGMHold' && currentStage?.type === 'action') {
+    // isResetReentry: we're returning to Action's GM Hold due to a reset, not advancing fresh.
+    // In all these cases the restore blocks above already handled the snapshot — no new push needed.
+    // Round Reset is explicitly excluded: it rebuilds from scratch (fresh tier entry at stage 0).
+    const isResetReentry =
+      prevMachineState === 'stageActive' ||
+      prevMachineState === 'stagePaused' ||
+      (prevMachineState === 'stageGMHold' && currentStageIndex <= prevStageIndex && lastIpcOp !== 'round-reset') ||
+      ((prevMachineState === 'stageSpin' || prevMachineState === 'stageSpinPaused') && currentStageIndex <= prevStageIndex)
+    if (!isResetReentry) {
+      battleLedger.push('tier')
+    }
+  }
+
+  // ── BattleLedger — stack cleanup on TC end / battle end ───────────────────
+  // Discard any lingering tier (and stage above it) when the round finishes or
+  // the GM ends the battle. The round snapshot is retained for the log history.
+
+  if (state === 'tcComplete' || state === 'battleEnded') {
+    battleLedger.discard('tier')
   }
 
   // ── Residual beat logging at TC end ──────────────────────────────────────
@@ -283,6 +633,7 @@ tcActor.subscribe((snapshot) => {
 
   mainWindow?.webContents.send('tc:state-update', payload)
   lanServer.broadcast({ type: 'TC_STATE', payload })
+  broadcastLedger()
 
   logger.debug(
     { machineState: state, round: snapshot.context.round, stageIndex: currentStageIndex },
@@ -304,6 +655,8 @@ ipcMain.on('tc:start-combat', () => {
   const beatsPerTC = activePlugin.getBeatsPerTC()
   const filtered   = filterStagesForRound(allStages, 1)
   const stages     = stagePlanner.plan(filtered, beatsPerTC)
+  battleLedger.reset()
+  battleLedger.push('round')
   tcActor.send({ type: 'START_COMBAT', stages, beatsPerTC })
 })
 
@@ -312,10 +665,37 @@ ipcMain.on('tc:start-combat', () => {
 // In stageSpin: ends spin early (only when backgroundOpsComplete is true).
 ipcMain.on('tc:gm-release', () => tcActor.send({ type: 'GM_RELEASE' }))
 
-// Skips the current stage.
-// From stageGMHold: zero beats consumed (administrative — timer never started).
-// From stageActive: full stage beat cost charged (characters did nothing this window).
-ipcMain.on('tc:pass',       () => tcActor.send({ type: 'PASS' }))
+// Skips the current stage. Full beat cost charged in all contexts.
+// Beat log entry written here (before the event fires) using the known post-pass formula:
+//   beatsRemaining after pass = max(0, beatsAtStageEntry − stage.beats)
+// Only logged for beat-consuming stages (beats > 0).
+ipcMain.on('tc:pass', () => {
+  const snap     = tcActor.getSnapshot()
+  const machState = String(snap.value)
+  if (machState === 'stageGMHold' || machState === 'stageActive' || machState === 'stagePaused') {
+    const ctx   = snap.context
+    const stage = ctx.stages[ctx.currentStageIndex]
+    if (stage && stage.beats > 0) {
+      const beatsRemainingAfter   = Math.max(0, ctx.beatsAtStageEntry - stage.beats)
+      const beatsConsumedAfter    = ctx.totalBeats - beatsRemainingAfter
+      battleLedger.logEntry({
+        round:         ctx.round,
+        tierIndex:     stage.tierIndex,
+        stageId:       stage.id,
+        stageName:     stage.name,
+        operation:     'gm-pass',
+        beatsConsumed: beatsConsumedAfter,
+      })
+    }
+  }
+  // Flag tells the subscription not to log a duplicate exit entry for the
+  // stageActive → stageSpin transition that this PASS event may produce.
+  // XState v5 processes the event synchronously, so the subscription fires
+  // inside send() while the flag is still set.
+  lastIpcOp = 'pass'
+  tcActor.send({ type: 'PASS' })
+  lastIpcOp = null
+})
 
 // Freezes the active timer (stageActive → stagePaused, stageSpin → stageSpinPaused).
 ipcMain.on('tc:pause',      () => tcActor.send({ type: 'PAUSE' }))
@@ -333,12 +713,30 @@ ipcMain.on('tc:stage-reset', () => tcActor.send({ type: 'STAGE_RESET' }))
 // Only fires when the current stage has a tierIndex (tier stages only).
 ipcMain.on('tc:tier-reset',  () => tcActor.send({ type: 'TIER_RESET' }))
 
+// Restarts the entire current round from stage 0.
+// Beat clock restored to totalBeats; stage pipeline rebuilt fresh for this round.
+// Available only in stageGMHold when not at the very first stage (currentStageIndex > 0).
+// BattleLedger restoration is done here (before send) so the subscription sees the clean state.
+ipcMain.on('tc:round-reset', () => {
+  pendingCrossTierCarry = null
+  battleLedger.restore('round')
+  battleLedger.push('round')
+  const snap    = tcActor.getSnapshot()
+  const round   = snap.context.round
+  const filtered = filterStagesForRound(activePlugin.getStages(), round)
+  const stages   = stagePlanner.plan(filtered, activePlugin.getBeatsPerTC())
+  lastIpcOp = 'round-reset'
+  tcActor.send({ type: 'ROUND_RESET', stages })
+  lastIpcOp = null
+})
+
 // Increments round, reloads round-filtered + StagePlanner-expanded stage list,
 // resets beat ledger to totalBeats.
 ipcMain.on('tc:next-round', () => {
   const nextRound = tcActor.getSnapshot().context.round + 1
   const filtered  = filterStagesForRound(activePlugin.getStages(), nextRound)
   const stages    = stagePlanner.plan(filtered, activePlugin.getBeatsPerTC())
+  battleLedger.push('round')
   tcActor.send({ type: 'NEXT_ROUND', stages })
 })
 
@@ -346,7 +744,10 @@ ipcMain.on('tc:next-round', () => {
 ipcMain.on('tc:end-battle', () => tcActor.send({ type: 'END_BATTLE' }))
 
 // Full reset to idle — clears all context including round, stages, and beat ledger.
-ipcMain.on('tc:reset',      () => tcActor.send({ type: 'RESET' }))
+ipcMain.on('tc:reset', () => {
+  battleLedger.reset()
+  tcActor.send({ type: 'RESET' })
+})
 
 // Opens the Group HUD window (1920×1080, no preload — read-only WebSocket client).
 // If already open, focuses it rather than creating a second instance.

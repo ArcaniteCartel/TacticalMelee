@@ -1,6 +1,29 @@
+// ── Preload — Electron IPC Bridge ─────────────────────────────────────────────
+//
+// This is the ONLY sanctioned entry point for the renderer process to communicate
+// with the Electron main process. contextBridge.exposeInMainWorld('api', api) makes
+// the api object available as window.api in the renderer (and only there — context
+// isolation prevents direct Node/Electron access from renderer code).
+//
+// The contract is asymmetric by design:
+//   Renderer → Main:  fire-and-forget via ipcRenderer.send('tc:...')
+//                     No return value. State changes are reflected in the next broadcast.
+//   Main → Renderer:  push via ipcRenderer.on('channel', callback)
+//                     Renderer subscribes with on*/off* helpers and receives payloads.
+//
+// IPC channel names here must exactly match the ipcMain.on('tc:...') handlers in
+// src/main/index.ts. There is no runtime validation of this mapping.
+//
+// Type safety: index.d.ts declares the TacticalMeleeAPI interface consumed by renderer
+// TypeScript. Both files must be updated together when channels are added or removed.
+//
+// The Group HUD does NOT use this preload — it has no preload script by design and
+// communicates exclusively via WebSocket (lanServer.ts port 3001).
+
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 import type { TCStatePayload } from '../shared/types'
+import type { BattleLedgerPayload } from '../shared/battleTypes'
 
 const api = {
   // ── TC controls ──────────────────────────────────────────────────────────
@@ -13,6 +36,7 @@ const api = {
   launchHUD:    (): void => ipcRenderer.send('tc:launch-hud'),
   stageReset:   (): void => ipcRenderer.send('tc:stage-reset'),
   tierReset:    (): void => ipcRenderer.send('tc:tier-reset'),
+  roundReset:   (): void => ipcRenderer.send('tc:round-reset'),
   endBattle:    (): void => ipcRenderer.send('tc:end-battle'),
   resetBattle:  (): void => ipcRenderer.send('tc:reset'),
 
@@ -33,6 +57,23 @@ const api = {
   },
   offStateUpdate: (): void => {
     ipcRenderer.removeAllListeners('tc:state-update')
+  },
+
+  // ── Battle Ledger subscription ────────────────────────────────────────────
+  onLedgerUpdate: (callback: (ledger: BattleLedgerPayload) => void): void => {
+    ipcRenderer.on('ledger:update', (_, payload: BattleLedgerPayload) => callback(payload))
+  },
+  offLedgerUpdate: (): void => {
+    ipcRenderer.removeAllListeners('ledger:update')
+  },
+
+  // ── Battle end notification ───────────────────────────────────────────────
+  // Fired once when the machine enters battleEnded. Used to auto-open the Battle Log.
+  onBattleEnd: (callback: () => void): void => {
+    ipcRenderer.on('tc:battle-ended', () => callback())
+  },
+  offBattleEnd: (): void => {
+    ipcRenderer.removeAllListeners('tc:battle-ended')
   },
 }
 
