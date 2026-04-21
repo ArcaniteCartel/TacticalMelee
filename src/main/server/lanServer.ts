@@ -2,11 +2,34 @@
  * LAN Server
  *
  * HTTP + WebSocket server embedded in the Electron main process.
- * - WebSocket: broadcasts TC state to all connected clients (Group HUD, future Player HUDs)
- * - Caches the last broadcast so new connections receive current state immediately
- * - HTTP: serves static HUD assets in production (dev uses Vite dev server)
+ * Serves the Group HUD (and future Player HUDs) over the local network.
  *
- * All clients receive the same state — time is shared, no per-client state.
+ * ── WebSocket ─────────────────────────────────────────────────────────────────
+ * Broadcasts WSMessage objects (TC_STATE and LEDGER_STATE) to all connected clients.
+ * All clients receive identical broadcasts — there is no per-client state filtering.
+ *
+ * Message cache strategy (messageCache: Map<string, string>):
+ *   The cache stores ONE message per message type (keyed by WSMessage.type).
+ *   On new connection, all cached types are replayed immediately so the client
+ *   receives the full current state rather than waiting for the next broadcast.
+ *
+ *   Why cache-one-per-type is sufficient (not a queue):
+ *     Both TC_STATE and LEDGER_STATE are always complete state snapshots — never diffs.
+ *     A client that misses N rapid broadcasts during a burst of TICKs is fully recovered
+ *     by the N+1th broadcast, which contains the current complete state.
+ *     Intermediate states do not need to be replayed; only the latest matters.
+ *     The two-type cache (not one slot) ensures TC_STATE and LEDGER_STATE are never
+ *     mutually overwritten — a client connecting mid-combat gets both.
+ *
+ *   Why readyState is checked before each send:
+ *     The WebSocket spec allows a brief window between 'close' firing and the client
+ *     being removed from the set. Checking readyState === OPEN prevents send() errors
+ *     on already-closing sockets.
+ *
+ * ── HTTP ──────────────────────────────────────────────────────────────────────
+ * In production: serves pre-built HUD static assets from the renderer output directory.
+ * In dev: Vite dev server serves the HUD at its own URL; this HTTP layer is inactive.
+ * /status endpoint: health check for LAN troubleshooting (returns { status, port }).
  */
 
 import express from 'express'
@@ -28,16 +51,18 @@ export function createLanServer(): LanServer {
   const wss = new WebSocketServer({ server })
 
   const clients = new Set<WebSocket>()
-  let lastBroadcast: string | null = null  // cached for new connections
+  // One cached message per message type so new connections receive the full
+  // current state (TC_STATE + LEDGER_STATE) rather than only the last broadcast.
+  const messageCache = new Map<string, string>()
 
   wss.on('connection', (ws) => {
     clients.add(ws)
     console.log(`[LAN] Client connected (${clients.size} total)`)
 
-    // Send current state immediately so the HUD never shows stale/idle data
-    if (lastBroadcast) {
-      ws.send(lastBroadcast)
-    }
+    // Replay all cached message types so the HUD never shows stale/idle data
+    messageCache.forEach((message) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(message)
+    })
 
     ws.on('close', () => {
       clients.delete(ws)
@@ -64,7 +89,9 @@ export function createLanServer(): LanServer {
   return {
     broadcast(data: unknown): void {
       const message = JSON.stringify(data)
-      lastBroadcast = message   // cache for late-connecting clients
+      // Cache by message type so each type has one current entry
+      const type = (data as { type?: string }).type
+      if (type) messageCache.set(type, message)
       clients.forEach((client) => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(message)

@@ -138,7 +138,7 @@ export class ActivePlugin {
     return ActivePlugin.STANDARD_CONFIG.stages
   }
 
-  /** Returns the number of beats per Tactical Cycle (e.g. 72 for the Standard plugin). */
+  /** Returns the number of beats per Tactical Cycle (60 for the Standard plugin). */
   getBeatsPerTC(): number {
     return ActivePlugin.STANDARD_CONFIG.beatsPerTC
   }

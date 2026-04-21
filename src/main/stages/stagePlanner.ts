@@ -68,6 +68,9 @@ export class StagePlanner {
    *   1. Separate preamble stages (everything before the first triad stage) from the template.
    *   2. Compute available beats = beatsPerTC − preamble beats.
    *   3. Greedy floor: tierCount = ⌊available / triadBeats⌋.
+   *      Floor (not ceil/round) is required — a partial tier would leave players mid-declaration
+   *      without a Resolution, which is a broken game state. The budget must always support full
+   *      triads. For the Standard plugin (60b − 4b preamble = 56b, 8b/tier) this yields exactly 7.
    *   4. Build expanded pipeline: preamble + tierCount copies of the triad, each with a
    *      scoped ID (action-t1, response-t1, ...) and a tierIndex.
    *
@@ -155,7 +158,10 @@ export class StagePlanner {
     fromStageIndex: number,
     surplusBeats: number
   ): StageDefinition[] {
-    if (surplusBeats <= 0.05) return pipeline  // below threshold — nothing meaningful to carry
+    // 0.05-beat threshold: floating-point beat calculations (e.g. 4 − 3.9500...01) can produce
+    // sub-cent surplus that would trigger a pipeline update for a negligible amount. 0.05 beats
+    // at a 4b/30s pace ≈ 0.375 s extension — imperceptible and not worth the overhead.
+    if (surplusBeats <= 0.05) return pipeline
 
     // Find the next beat-consuming stage after the source
     const targetIndex = pipeline.findIndex((s, i) => i > fromStageIndex && s.beats > 0)
