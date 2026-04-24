@@ -1,0 +1,8 @@
+@keyframes tm-release-pulse {
+  0%, 100% { box-shadow: 0 0 4px 1px var(--tm-accent-dim); }
+  50%       { box-shadow: 0 0 12px 3px color-mix(in srgb, var(--tm-accent) 50%, transparent); }
+}
+
+.tm-release-waiting {
+  animation: tm-release-pulse 2.5s ease-in-out infinite;
+}
