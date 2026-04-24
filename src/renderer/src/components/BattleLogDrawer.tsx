@@ -56,16 +56,16 @@ export function BattleLogDrawer({ opened, onClose, ledger }: BattleLogDrawerProp
                 >
                   <Group justify="space-between" align="center" gap="xs" wrap="nowrap">
                     <Group gap={6} align="center" wrap="nowrap">
-                      {/* "R:B" beat position label — round:beatsConsumed */}
+                      {/* "R:T:B" beat position label — round:tier:beatsConsumed */}
                       <Text
                         size="xs"
                         fw={600}
                         ff="monospace"
                         c="var(--tm-accent)"
-                        title={`Round ${e.round}, Beat ${e.beatsConsumed.toFixed(1)}`}
+                        title={`Round ${e.round}, Tier ${e.tierIndex !== undefined ? e.tierIndex + 1 : 0}, Beat ${e.beatsConsumed.toFixed(1)}`}
                         style={{ flexShrink: 0 }}
                       >
-                        {e.round}:{e.beatsConsumed.toFixed(1)}
+                        {e.round}:{e.tierIndex !== undefined ? e.tierIndex + 1 : 0}:{e.beatsConsumed.toFixed(1)}
                       </Text>
                       <Text size="xs" style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                         {e.stageName}

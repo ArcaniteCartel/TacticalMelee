@@ -18,12 +18,19 @@
  *   'stage'  — on entering stageActive (subscription)
  *
  * Discard (normal completion — no restore):
- *   'stage'  — on stageActive → stageSpin (stage ended)
- *   'tier'   — on Resolution stageSpin → stageGMHold (tier completed normally)
+ *   'stage'  — on stageActive → stageSpin (stage ended via spin)
+ *   'stage'  — on stageActive → stageGMHold forward (gm-release stage, no spin window)
+ *   'tier'   — on Resolution stageSpin → stageGMHold forward (tier completed normally)
  *
  * Restore (reset — roll back beat log to pre-entry state):
  *   'stage'  — Stage Reset (stageActive / stageSpin → stageGMHold, same index)
- *   'tier'   — Tier Reset (stageActive / stageSpin → stageGMHold, backward index)
+ *   'tier'   — Tier Reset (stageActive / stageSpin / stageGMHold → stageGMHold, backward index)
+ *
+ * Post-restore push invariant:
+ *   After every restore('tier'), the caller immediately calls push('tier') to re-anchor
+ *   the snapshot at the restored state. This allows a second Tier Reset on the same re-run
+ *   to find a valid tier entry. The isResetReentry guard at the tier-push check site prevents
+ *   a duplicate push from the subscription's normal tier-entry block.
  */
 
 import type { BattleLedgerData, BeatLogEntry } from '../../shared/battleTypes'
@@ -36,6 +43,15 @@ interface LabeledSnapshot {
 export class BattleLedger {
   private data: BattleLedgerData = { beatLog: [] }
   private stack: LabeledSnapshot[] = []
+
+  // Hierarchy levels used to enforce that discard/restore never scan past a
+  // lower-level anchor. discard('tier') must not pop a 'round' entry; doing so
+  // would silently destroy the round snapshot and break future Round Reset.
+  private static readonly hierarchyLevel: Record<'round' | 'tier' | 'stage', number> = {
+    round: 0,
+    tier:  1,
+    stage: 2,
+  }
 
   // ── Clone strategy ────────────────────────────────────────────────────────
   // Swap this method out if JSON clone becomes a performance concern.
@@ -51,25 +67,39 @@ export class BattleLedger {
   }
 
   /**
-   * Discard the topmost snapshot of the given type and any entries above it.
-   * Does not restore state — used on normal (non-reset) stage/tier completion.
+   * Discard the topmost snapshot of the given type and any higher-level entries above it.
+   * Stops before crossing a lower-level anchor — a no-op if the type is not found above
+   * any lower-level entry. Used on normal (non-reset) stage/tier completion.
    */
   discard(type: 'round' | 'tier' | 'stage'): void {
-    while (this.stack.length > 0 && this.stack[this.stack.length - 1].type !== type) {
+    const targetLevel = BattleLedger.hierarchyLevel[type]
+    while (
+      this.stack.length > 0 &&
+      this.stack[this.stack.length - 1].type !== type &&
+      BattleLedger.hierarchyLevel[this.stack[this.stack.length - 1].type] > targetLevel
+    ) {
       this.stack.pop()
     }
-    if (this.stack.length > 0) this.stack.pop()
+    if (this.stack.length > 0 && this.stack[this.stack.length - 1].type === type) {
+      this.stack.pop()
+    }
   }
 
   /**
    * Restore current data from the topmost snapshot of the given type, discarding
-   * any entries above it. Used on Stage Reset and Tier Reset.
+   * any higher-level entries above it. Stops before crossing a lower-level anchor —
+   * a no-op if the type is not found. Used on Stage Reset and Tier Reset.
    */
   restore(type: 'round' | 'tier' | 'stage'): void {
-    while (this.stack.length > 0 && this.stack[this.stack.length - 1].type !== type) {
+    const targetLevel = BattleLedger.hierarchyLevel[type]
+    while (
+      this.stack.length > 0 &&
+      this.stack[this.stack.length - 1].type !== type &&
+      BattleLedger.hierarchyLevel[this.stack[this.stack.length - 1].type] > targetLevel
+    ) {
       this.stack.pop()
     }
-    if (this.stack.length > 0) {
+    if (this.stack.length > 0 && this.stack[this.stack.length - 1].type === type) {
       this.data = this.cloneData(this.stack.pop()!.data)
     }
   }
@@ -93,4 +123,5 @@ export class BattleLedger {
   getData(): BattleLedgerData {
     return this.data
   }
+
 }

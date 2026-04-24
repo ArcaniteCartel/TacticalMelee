@@ -133,16 +133,25 @@ export function GmControls({ onBattleLogOpen }: GmControlsProps): JSX.Element {
   const canPause       = (isActive && currentStage?.type !== 'gm-release') || isSpin
   const canResume      = isPaused || isSpinPaused
 
-  // Stage Reset: restarts current stage. Available in active countdown, paused, and spin modes.
-  const canStageReset  = (isActive || isPaused || isSpin || isSpinPaused) && inCombat
+  // Stage Reset: restarts current stage. Available for activity stages (timed/action/response)
+  // only — not for administrative system stages (surprise, initiative, resolution, gm-release).
+  // Restricted at the machine level too; this guard keeps the button hidden rather than enabled-but-rejected.
+  // isActivityStage: mirrors isTimedStageType() from shared/types.ts — timed/action/response only.
+  // Inlined here because the renderer cannot import runtime values from @shared (type-only imports only).
+  const isActivityStage = currentStage?.type === 'timed' || currentStage?.type === 'action' || currentStage?.type === 'response'
+  const canStageReset  = (isActive || isPaused || isSpin || isSpinPaused) && inCombat && isActivityStage
 
   // Tier Reset: available on any tier stage in active/paused/spin modes, plus stageGMHold
   // when not on the first stage of the tier (only Response's hold qualifies in standard pipeline).
   const canTierReset   = currentStage?.tierIndex !== undefined && inCombat &&
     (isActive || isPaused || isSpin || isSpinPaused || (isGMHold && currentStage?.type !== 'action'))
 
-  // Round Reset: available in any GM hold that is not the very first stage of the round.
-  const canRoundReset  = isGMHold && (tc?.currentStageIndex ?? 0) > 0
+  // Round Reset: available at any point in the round once past the opening stage (index > 0).
+  // Excludes only the very first stage of the round (e.g. GM Narrative hold or stageActive at index 0)
+  // — at that point nothing has happened yet and a reset is meaningless.
+  // Available in stageActive, stagePaused, stageSpin, stageSpinPaused, and stageGMHold.
+  const canRoundReset  = (isActive || isPaused || isSpin || isSpinPaused || isGMHold) &&
+                         (tc?.currentStageIndex ?? 0) > 0
 
   const canEndBattle   = !isIdle && !isBattleEnded
   const canReset       = true

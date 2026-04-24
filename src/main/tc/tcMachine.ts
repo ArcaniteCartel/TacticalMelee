@@ -131,7 +131,10 @@ export type TCEvent =
   /**
    * Restarts the entire current round from stage 0.
    * Beat clock restored to totalBeats; stage pipeline rebuilt from scratch for this round.
-   * Available in stageGMHold when currentStageIndex > 0 (i.e., not the very first stage).
+   * Available in stageGMHold, stageActive, stagePaused, stageSpin, and stageSpinPaused
+   * when currentStageIndex > 0 (i.e., not the very first stage of the round).
+   * The guard prevents Round Reset when nothing has yet happened in the round — e.g.
+   * the opening stageGMHold or the opening gm-release stage at index 0.
    */
   | { type: 'ROUND_RESET'; stages: StageDefinition[] }
   | { type: 'NEXT_ROUND'; stages: StageDefinition[] }
@@ -452,10 +455,17 @@ export const tcMachine = createMachine({
         },
 
         // Stage Reset: restarts the current stage from the beginning.
+        // Only available for activity stages (timed, action, response) — NOT for administrative
+        // system stages (surprise-determination, initiative-determination, resolution, gm-release).
+        // Re-running system computations requires a dedicated mechanic (open design question).
         // Beat clock restored to beatsAtStageEntry. If resetting the Action stage, also
         // restores the Response stage's beats/timer from the tier snapshot — undoing any
         // intra-tier carry-forward (Action early-release surplus → Response) already applied.
         STAGE_RESET: {
+          guard: ({ context }) => {
+            const stage = context.stages[context.currentStageIndex]
+            return !!stage && isTimedStageType(stage.type)
+          },
           target: 'stageGMHold',
           actions: assign(({ context }) => {
             const currentStage = context.stages[context.currentStageIndex]
@@ -509,6 +519,25 @@ export const tcMachine = createMachine({
               stages,
             }
           }),
+        },
+
+        // Round Reset: restarts the entire round from stage 0.
+        // Available in stageActive when currentStageIndex > 0 (not the opening stage).
+        // Same action and routing as stageGMHold.ROUND_RESET — see that handler for rationale.
+        ROUND_RESET: {
+          guard: ({ context }) => context.currentStageIndex > 0,
+          target: 'checkAdvance',
+          actions: assign(({ context, event }) => ({
+            stages: event.stages,
+            currentStageIndex: -1,
+            timerSecondsRemaining: 0,
+            spinSecondsRemaining: 0,
+            backgroundOpsComplete: true,
+            beatsRemaining: context.totalBeats,
+            beatsAtStageEntry: context.totalBeats,
+            beatsAtTierEntry: 0,
+            tierStageSnapshot: null,
+          })),
         },
 
         // StagePlanner carry-forward: replace pipeline with carry-forward-adjusted copy.
@@ -811,9 +840,14 @@ export const tcMachine = createMachine({
         PAUSE: { target: 'stageSpinPaused' },
 
         // Stage Reset during spin: cancel spin, restart current stage from GM hold.
+        // Guard: activity stages only (timed/action/response) — not administrative system stages.
         // If resetting the Action stage, restores Response beats/timer from tier snapshot to
         // undo intra-tier carry-forward that was applied when Action exited to this spin.
         STAGE_RESET: {
+          guard: ({ context }) => {
+            const stage = context.stages[context.currentStageIndex]
+            return !!stage && isTimedStageType(stage.type)
+          },
           target: 'stageGMHold',
           actions: assign(({ context }) => {
             const currentStage = context.stages[context.currentStageIndex]
@@ -866,6 +900,23 @@ export const tcMachine = createMachine({
           }),
         },
 
+        // Round Reset: same guard and action as stageActive.ROUND_RESET.
+        ROUND_RESET: {
+          guard: ({ context }) => context.currentStageIndex > 0,
+          target: 'checkAdvance',
+          actions: assign(({ context, event }) => ({
+            stages: event.stages,
+            currentStageIndex: -1,
+            timerSecondsRemaining: 0,
+            spinSecondsRemaining: 0,
+            backgroundOpsComplete: true,
+            beatsRemaining: context.totalBeats,
+            beatsAtStageEntry: context.totalBeats,
+            beatsAtTierEntry: 0,
+            tierStageSnapshot: null,
+          })),
+        },
+
         // StagePlanner carry-forward can arrive during spin (carry-forward was detected on
         // stage exit and the UPDATE_PIPELINE event may arrive before spin completes).
         UPDATE_PIPELINE: { actions: assign({ stages: ({ event }) => event.stages }) },
@@ -883,7 +934,12 @@ export const tcMachine = createMachine({
       on: {
         RESUME:          { target: 'stageSpin' },
 
+        // Guard: activity stages only — same restriction as stageActive/stageSpin STAGE_RESET.
         STAGE_RESET: {
+          guard: ({ context }) => {
+            const stage = context.stages[context.currentStageIndex]
+            return !!stage && isTimedStageType(stage.type)
+          },
           target: 'stageGMHold',
           actions: assign(({ context }) => {
             const currentStage = context.stages[context.currentStageIndex]
@@ -932,6 +988,23 @@ export const tcMachine = createMachine({
               stages,
             }
           }),
+        },
+
+        // Round Reset: same guard and action as stageActive.ROUND_RESET.
+        ROUND_RESET: {
+          guard: ({ context }) => context.currentStageIndex > 0,
+          target: 'checkAdvance',
+          actions: assign(({ context, event }) => ({
+            stages: event.stages,
+            currentStageIndex: -1,
+            timerSecondsRemaining: 0,
+            spinSecondsRemaining: 0,
+            backgroundOpsComplete: true,
+            beatsRemaining: context.totalBeats,
+            beatsAtStageEntry: context.totalBeats,
+            beatsAtTierEntry: 0,
+            tierStageSnapshot: null,
+          })),
         },
 
         UPDATE_PIPELINE: { actions: assign({ stages: ({ event }) => event.stages }) },
@@ -944,14 +1017,19 @@ export const tcMachine = createMachine({
      * Active-stage paused state: the countdown timer is frozen at its current value.
      * The external TICK interval is stopped while this state is active.
      * Resumes back into stageActive (timer continues from where it was frozen).
-     * STAGE_RESET and TIER_RESET are available here (same logic as stageActive).
+     * STAGE_RESET, TIER_RESET, and ROUND_RESET are available here (same logic as stageActive).
      * PAUSE arrives from stageActive on any timed stage (gm-release and stageGMHold excluded).
      */
     stagePaused: {
       on: {
         RESUME:          { target: 'stageActive' },
 
+        // Guard: activity stages only — same restriction as stageActive STAGE_RESET.
         STAGE_RESET: {
+          guard: ({ context }) => {
+            const stage = context.stages[context.currentStageIndex]
+            return !!stage && isTimedStageType(stage.type)
+          },
           target: 'stageGMHold',
           actions: assign(({ context }) => {
             const currentStage = context.stages[context.currentStageIndex]
@@ -1000,6 +1078,23 @@ export const tcMachine = createMachine({
               stages,
             }
           }),
+        },
+
+        // Round Reset: same guard and action as stageActive.ROUND_RESET.
+        ROUND_RESET: {
+          guard: ({ context }) => context.currentStageIndex > 0,
+          target: 'checkAdvance',
+          actions: assign(({ context, event }) => ({
+            stages: event.stages,
+            currentStageIndex: -1,
+            timerSecondsRemaining: 0,
+            spinSecondsRemaining: 0,
+            backgroundOpsComplete: true,
+            beatsRemaining: context.totalBeats,
+            beatsAtStageEntry: context.totalBeats,
+            beatsAtTierEntry: 0,
+            tierStageSnapshot: null,
+          })),
         },
 
         UPDATE_PIPELINE: { actions: assign({ stages: ({ event }) => event.stages }) },

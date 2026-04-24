@@ -235,6 +235,7 @@ tcActor.subscribe((snapshot) => {
   if (state === 'checkAdvance') return
 
   const { stages, currentStageIndex } = snapshot.context
+
   const currentStage = stages[currentStageIndex]
 
   // ── Stage Registry hook dispatch ─────────────────────────────────────────
@@ -440,13 +441,21 @@ tcActor.subscribe((snapshot) => {
   //   stageSpinPaused    stageGMHold  lower           —            Tier Reset  from spin-paused
   //   stageGMHold        stageGMHold  lower           —            Tier Reset  from Response hold
   //   stageGMHold        checkAdvance lower           'round-reset' Round Reset (IPC handled ledger)
+  //   stageActive        stageActive  lower           'round-reset' Round Reset from active stage
+  //   stageActive        stageGMHold  lower/same      'round-reset' Round Reset (plugin: action-first)
+  //   stageSpin          stageActive  lower           'round-reset' Round Reset from spin
+  //   stageSpin          stageGMHold  lower/same      'round-reset' Round Reset (plugin: action-first)
+  //   stagePaused        stageActive  lower           'round-reset' Round Reset from paused stage
+  //   stageSpinPaused    stageActive  lower           'round-reset' Round Reset from spin-paused
   //
   //   stageSpin          stageGMHold  HIGHER          —            NORMAL forward advance (not reset!)
   //   any                any          same or higher  —            Normal transition — not a reset
   //
   // Round Reset: pendingCrossTierCarry was already cleared in the IPC handler. The ledger
   // was restored there before tcActor.send(), using lastIpcOp = 'round-reset' to distinguish
-  // it from a Tier Reset from Response hold (which shares the same state transition shape).
+  // it from a Tier Reset from Response hold (which shares the stageGMHold→stageGMHold shape).
+  // The restore blocks below also check lastIpcOp !== 'round-reset' to prevent a double-restore
+  // when ROUND_RESET routes through stageActive/stageSpin → stageGMHold (action-first plugin).
   //
   // Pending carry discard: if a reset fires while pendingCrossTierCarry is set (Response
   // released early, then Tier Reset from Resolution spin), the carry is forfeited — the
@@ -484,11 +493,13 @@ tcActor.subscribe((snapshot) => {
     }
   }
 
-  // ── BattleLedger — snapshot restore on Stage Reset / Tier Reset ──────────
+  // ── BattleLedger — snapshot restore/discard on Stage Reset / Tier Reset ──
   //
-  // stageActive → stageGMHold: always a reset (no normal exit goes directly there).
+  // stageActive → stageGMHold: three cases by index direction.
   //   Same index  → Stage Reset: restore stage snapshot.
   //   Lower index → Tier Reset: restore tier snapshot (which also discards stage above it).
+  //   Higher index → Forward: gm-release stage (e.g. GM Narrative) completed with no spin;
+  //                           discard its stage snapshot as normal completion.
   //
   // stagePaused → stageGMHold: same semantics as stageActive → stageGMHold.
   //
@@ -499,17 +510,27 @@ tcActor.subscribe((snapshot) => {
   // stageGMHold → stageGMHold (lower index, not round-reset): Tier Reset from Response hold.
   //   Round Reset is excluded: IPC handler already restored the ledger before send().
 
-  if ((prevMachineState === 'stageActive' || prevMachineState === 'stagePaused') && state === 'stageGMHold') {
+  // Round Reset is excluded from all restore blocks: the IPC handler already called
+  // battleLedger.restore('round') before send(), so a subscription-side restore here
+  // would double-pop the stack and corrupt the ledger state.
+  if ((prevMachineState === 'stageActive' || prevMachineState === 'stagePaused') && state === 'stageGMHold' && lastIpcOp !== 'round-reset') {
     if (currentStageIndex < prevStageIndex) {
       battleLedger.restore('tier')
-    } else {
+      battleLedger.push('tier')
+    } else if (currentStageIndex === prevStageIndex) {
       battleLedger.restore('stage')
+    } else {
+      // Forward transition: a gm-release stage (e.g. GM Narrative) completed with no spin
+      // window and advanced directly to the next stageGMHold. Discard its stage snapshot
+      // as normal completion — this is not a reset path.
+      battleLedger.discard('stage')
     }
   }
 
-  if ((prevMachineState === 'stageSpin' || prevMachineState === 'stageSpinPaused') && state === 'stageGMHold' && currentStageIndex <= prevStageIndex) {
+  if ((prevMachineState === 'stageSpin' || prevMachineState === 'stageSpinPaused') && state === 'stageGMHold' && currentStageIndex <= prevStageIndex && lastIpcOp !== 'round-reset') {
     if (currentStageIndex < prevStageIndex) {
       battleLedger.restore('tier')
+      battleLedger.push('tier')
     } else {
       battleLedger.restore('stage')
     }
@@ -517,6 +538,7 @@ tcActor.subscribe((snapshot) => {
 
   if (prevMachineState === 'stageGMHold' && state === 'stageGMHold' && currentStageIndex < prevStageIndex && lastIpcOp !== 'round-reset') {
     battleLedger.restore('tier')
+    battleLedger.push('tier')
   }
 
   // ── BattleLedger — snapshot discard on normal forward advance from spin ───
@@ -559,14 +581,17 @@ tcActor.subscribe((snapshot) => {
   // Reset reentry detection (isResetReentry) prevents pushing a duplicate snapshot when
   // returning to Action stageGMHold via Stage Reset, Tier Reset, or Round Reset — in those
   // cases the restore block above has already handled the ledger state.
+  // The stageActive/stagePaused arms require currentStageIndex <= prevStageIndex so that a
+  // forward transition (GM Narrative → Action, higher index) is NOT mistaken for a reset.
 
   if (entering && state === 'stageGMHold' && currentStage?.type === 'action') {
     // isResetReentry: we're returning to Action's GM Hold due to a reset, not advancing fresh.
     // In all these cases the restore blocks above already handled the snapshot — no new push needed.
-    // Round Reset is explicitly excluded: it rebuilds from scratch (fresh tier entry at stage 0).
+    // stageActive/stagePaused arms: excluded by index direction (forward = higher index = not a reset).
+    // stageGMHold arm: Round Reset excluded via lastIpcOp — IPC handler already handled the ledger.
     const isResetReentry =
-      prevMachineState === 'stageActive' ||
-      prevMachineState === 'stagePaused' ||
+      (prevMachineState === 'stageActive' && currentStageIndex <= prevStageIndex) ||
+      (prevMachineState === 'stagePaused' && currentStageIndex <= prevStageIndex) ||
       (prevMachineState === 'stageGMHold' && currentStageIndex <= prevStageIndex && lastIpcOp !== 'round-reset') ||
       ((prevMachineState === 'stageSpin' || prevMachineState === 'stageSpinPaused') && currentStageIndex <= prevStageIndex)
     if (!isResetReentry) {
@@ -715,8 +740,10 @@ ipcMain.on('tc:tier-reset',  () => tcActor.send({ type: 'TIER_RESET' }))
 
 // Restarts the entire current round from stage 0.
 // Beat clock restored to totalBeats; stage pipeline rebuilt fresh for this round.
-// Available only in stageGMHold when not at the very first stage (currentStageIndex > 0).
-// BattleLedger restoration is done here (before send) so the subscription sees the clean state.
+// Available in stageGMHold, stageActive, stagePaused, stageSpin, and stageSpinPaused
+// when currentStageIndex > 0 (not the very first stage of the round).
+// BattleLedger restoration is done here (before send) so the subscription sees the clean
+// state and the restore blocks skip themselves via lastIpcOp === 'round-reset'.
 ipcMain.on('tc:round-reset', () => {
   pendingCrossTierCarry = null
   battleLedger.restore('round')

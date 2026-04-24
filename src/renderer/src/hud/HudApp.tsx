@@ -179,9 +179,9 @@ export function HudApp(): JSX.Element {
   //   stageName      — human-readable stage label
   //   operation      — what happened (stage-start / gm-release / time-expired / gm-pass)
   //
-  // Display format: "R:B  Stage Name  [OPERATION BADGE]"
-  // where R = round number, B = beats consumed (1 decimal place).
-  // The full tooltip on the R:B label shows "Round N, Beat N.N" for accessibility.
+  // Display format: "R:T:B  Stage Name  [OPERATION BADGE]"
+  // where R = round number, T = tier (0 for preamble stages), B = beats consumed (1 decimal place).
+  // The full tooltip on the R:T:B label shows "Round N, Tier N, Beat N.N" for accessibility.
   if (isBattleEnded) {
     const entries = ledger?.beatLog ?? []
     return (
@@ -212,16 +212,16 @@ export function HudApp(): JSX.Element {
                 >
                   <Group justify="space-between" align="center" gap="xs" wrap="nowrap">
                     <Group gap={10} align="center" wrap="nowrap">
-                      {/* Beat position label: "R:B" — round number : beats consumed at event time */}
+                      {/* Beat position label: "R:T:B" — round:tier:beatsConsumed */}
                       <Text
                         size="sm"
                         fw={700}
                         ff="monospace"
                         c="var(--tm-accent)"
-                        title={`Round ${e.round}, Beat ${e.beatsConsumed.toFixed(1)}`}
-                        style={{ flexShrink: 0, minWidth: '4rem' }}
+                        title={`Round ${e.round}, Tier ${e.tierIndex !== undefined ? e.tierIndex + 1 : 0}, Beat ${e.beatsConsumed.toFixed(1)}`}
+                        style={{ flexShrink: 0, minWidth: '5rem' }}
                       >
-                        {e.round}:{e.beatsConsumed.toFixed(1)}
+                        {e.round}:{e.tierIndex !== undefined ? e.tierIndex + 1 : 0}:{e.beatsConsumed.toFixed(1)}
                       </Text>
                       <Text size="sm">{e.stageName}</Text>
                     </Group>

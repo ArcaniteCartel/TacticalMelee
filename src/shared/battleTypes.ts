@@ -9,12 +9,12 @@ export type BeatLogOperation = 'stage-start' | 'gm-release' | 'time-expired' | '
  * beatsConsumed: total beats consumed in the current round at the moment this event fired.
  * Computed as (totalBeats − beatsRemaining) at the time of logging.
  *
- * Display format: "R:B" where R = round and B = beatsConsumed (1dp).
- * e.g. "1:4.0" = Round 1, 4 beats consumed at this point.
+ * Display format: "R:T:B" where R = round, T = tier (0 for preamble stages), B = beatsConsumed (1dp).
+ * e.g. "1:2:4.0" = Round 1, Tier 2, 4 beats consumed at this point.
  */
 export interface BeatLogEntry {
   round: number
-  tierIndex?: number     // undefined for preamble stages
+  tierIndex?: number     // undefined for preamble stages; 0-based (tier 1 → 0). Add 1 for display.
   stageId: string
   stageName: string
   operation: BeatLogOperation
