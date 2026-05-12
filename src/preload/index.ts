@@ -24,6 +24,7 @@ import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 import type { TCStatePayload } from '../shared/types'
 import type { BattleLedgerPayload } from '../shared/battleTypes'
+import type { ActiveConfigPayload, SaveResult, RestoreResult } from '../shared/editorTypes'
 
 const api = {
   // ── TC controls ──────────────────────────────────────────────────────────
@@ -74,6 +75,38 @@ const api = {
   },
   offBattleEnd: (): void => {
     ipcRenderer.removeAllListeners('tc:battle-ended')
+  },
+
+  // ── Plugin editor ─────────────────────────────────────────────────────────
+  openPluginEditor: (): void => ipcRenderer.send('plugin:open-editor'),
+
+  // Returns the currently active plugin config plus mode tag.
+  // Raw object includes any extra fields preserved from a custom YAML.
+  getActivePluginConfig: (): Promise<ActiveConfigPayload> =>
+    ipcRenderer.invoke('plugin:get-active-config'),
+
+  // Returns true when the XState machine is in the 'idle' state.
+  isIdle: (): Promise<boolean> =>
+    ipcRenderer.invoke('plugin:is-idle'),
+
+  // Saves the serialised YAML to disk, live-reloads if idle.
+  saveCustomPlugin: (yaml: string): Promise<SaveResult> =>
+    ipcRenderer.invoke('plugin:save-custom', yaml),
+
+  // Archives the custom YAML and reverts the active plugin to standard.
+  restorePluginDefaults: (): Promise<RestoreResult> =>
+    ipcRenderer.invoke('plugin:restore-defaults'),
+
+  // Opens a native Save dialog and writes the YAML there.
+  downloadPluginYaml: (yaml: string): Promise<void> =>
+    ipcRenderer.invoke('plugin:download-yaml', yaml),
+
+  // Broadcast from main when the active plugin mode changes (standard ↔ custom).
+  onPluginModeChanged: (callback: (mode: 'standard' | 'custom') => void): void => {
+    ipcRenderer.on('plugin:mode-changed', (_, mode) => callback(mode))
+  },
+  offPluginModeChanged: (): void => {
+    ipcRenderer.removeAllListeners('plugin:mode-changed')
   },
 }
 

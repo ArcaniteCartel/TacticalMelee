@@ -24,9 +24,9 @@
 //   State flows one-way: main process → renderer via IPC events (never renderer → main
 //   via subscription; commands go through window.api.* fire-and-forget methods instead).
 
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { useDisclosure } from '@mantine/hooks'
-import { Box, Container, Text, Stack, Divider, Badge, Group, Paper } from '@mantine/core'
+import { Box, Container, Text, Stack, Divider, Badge, Group, Paper, Tooltip } from '@mantine/core'
 import { TopBar }           from './components/TopBar'
 import { SettingsDrawer }   from './components/SettingsDrawer'
 import { GmControls }       from './components/GmControls'
@@ -39,18 +39,24 @@ export default function App(): JSX.Element {
 
   // gmAlerts is a queue: TopBar shows the first item, dismiss removes it and reveals the next.
   // Alerts originate from the main process via tm:gm-alert IPC (plugin config errors, etc.).
-  const [gmAlerts, setGmAlerts] = useState<string[]>([])
-  const [ledger, setLedger] = useState<BattleLedgerPayload | null>(null)
+  const [gmAlerts,    setGmAlerts]    = useState<string[]>([])
+  const [ledger,      setLedger]      = useState<BattleLedgerPayload | null>(null)
+  const [pluginMode,  setPluginMode]  = useState<'standard' | 'custom'>('standard')
 
-  React.useEffect(() => {
+  useEffect(() => {
     // Forward main-process dev log lines to DevTools console (no-ops in production).
     window.api.onDevLog((message) => console.log(message))
     // Append each GM alert to the queue; TopBar handles display and dismissal ordering.
     window.api.onGmAlert((message) => setGmAlerts(prev => [...prev, message]))
     // Keep ledger state in sync for the Battle Log drawer.
     window.api.onLedgerUpdate((payload) => setLedger(payload))
+    // Track plugin mode so the badge reflects Standard / Custom in real time.
+    window.api.onPluginModeChanged((mode) => setPluginMode(mode))
+    // Fetch initial mode (custom YAML may already be active on startup).
+    window.api.getActivePluginConfig().then(({ mode }) => setPluginMode(mode))
     return () => {
       window.api.offLedgerUpdate()
+      window.api.offPluginModeChanged()
     }
   }, [])
 
@@ -76,10 +82,23 @@ export default function App(): JSX.Element {
               System Status
             </Text>
             <Group gap="sm">
-              <Paper p="md" style={{ flex: 1, backgroundColor: 'var(--tm-surface)', border: '1px solid var(--tm-border)' }}>
-                <Text size="xs" c="dimmed" mb={4}>Plugin</Text>
-                <Badge color="green" variant="light">Standard</Badge>
-              </Paper>
+              <Tooltip label="Click to open the Plugin Profile Editor" withArrow openDelay={400}>
+                <Paper
+                  p="md"
+                  style={{
+                    flex: 1,
+                    backgroundColor: 'var(--tm-surface)',
+                    border: '1px solid var(--tm-border)',
+                    cursor: 'pointer',
+                  }}
+                  onClick={() => window.api.openPluginEditor()}
+                >
+                  <Text size="xs" c="dimmed" mb={4}>Plugin</Text>
+                  <Badge color={pluginMode === 'custom' ? 'violet' : 'green'} variant="light">
+                    {pluginMode === 'custom' ? 'Custom' : 'Standard'}
+                  </Badge>
+                </Paper>
+              </Tooltip>
               <Paper p="md" style={{ flex: 1, backgroundColor: 'var(--tm-surface)', border: '1px solid var(--tm-border)' }}>
                 <Text size="xs" c="dimmed" mb={4}>Players Connected</Text>
                 <Badge color="gray" variant="light">0 / 0</Badge>

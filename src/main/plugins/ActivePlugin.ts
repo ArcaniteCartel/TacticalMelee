@@ -128,6 +128,11 @@ export class ActivePlugin {
     ],
   }
 
+  /** Exposes the hardcoded standard config for PluginManager and editor initialization. */
+  static getStandardConfig(): PluginConfig {
+    return ActivePlugin.STANDARD_CONFIG
+  }
+
   /** Returns the full plugin configuration including all stage definitions. */
   getConfig(): PluginConfig {
     return ActivePlugin.STANDARD_CONFIG

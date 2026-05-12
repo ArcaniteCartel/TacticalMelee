@@ -1,0 +1,106 @@
+pluginName: "TacticalMelee Standard"
+beatsPerTC: 60
+minAdjustedTimerSeconds: 5
+
+stages:
+
+  - id: gm-narrative
+    name: "GM Narrative"
+    type: gm-release
+    beats: 0
+    canPass: true
+    spinTime: 0
+    roundVisibility: []       # active every round
+    description: >
+      The GM is setting the scene. Listen for narrative context before the
+      encounter begins.
+
+  - id: pre-encounter
+    name: "Pre-Encounter"
+    type: timed
+    beats: 4
+    timerSeconds: 20
+    canPass: true
+    spinTime: 3
+    roundVisibility: ["A1", "I2"]   # round 1 only
+    description: >
+      Make pre-combat adjustments — swap weapons, consume items, or declare
+      readiness. 4 beats remain.
+
+  - id: morale
+    name: "Morale"
+    type: timed
+    beats: 4
+    timerSeconds: 20
+    canPass: true
+    spinTime: 3
+    roundVisibility: ["i1"]         # round 2 and later only
+    description: >
+      Perform morale actions before the round begins. Players and NPCs with
+      morale abilities may act now.
+
+  - id: surprise-determination
+    name: "Surprise Determination"
+    type: surprise-determination
+    beats: 0
+    canPass: true
+    spinTime: 3
+    roundVisibility: ["A1", "I2"]   # round 1 only
+    description: >
+      The system is determining surprise conditions for this encounter.
+
+  - id: initiative-determination
+    name: "Initiative Determination"
+    type: initiative-determination
+    beats: 0
+    canPass: true
+    spinTime: 3
+    roundVisibility: []             # active every round
+    description: >
+      The system is calculating initiative order for all combatants.
+
+  # ── Action Tier template (expanded by StagePlanner into 7 triads) ──────────
+  # StagePlanner.plan() repeats Action + Response + Resolution until the
+  # remaining beat budget (56b after preamble) is exhausted.
+  # 7 tiers × 8b (4b Action + 4b Response + 0b Resolution) = 56b exactly.
+
+  - id: action
+    name: "Action"
+    type: action
+    beats: 4
+    timerSeconds: 30
+    canPass: true
+    spinTime: 1
+    roundVisibility: []             # active every round
+    description: >
+      Declare your action for this round. You have 30 seconds.
+
+  - id: response
+    name: "Response"
+    type: response
+    beats: 4
+    timerSeconds: 30
+    canPass: true
+    spinTime: 1
+    roundVisibility: []             # active every round
+    description: >
+      Declare your response to the current situation. You have 30 seconds.
+
+  - id: resolution
+    name: "Resolution"
+    type: resolution
+    beats: 0
+    spinTime: 3
+    roundVisibility: []             # active every round
+    description: >
+      The system is resolving all declared actions and responses.
+    # canPass omitted — resolution is mandatory and cannot be skipped
+
+# ── Beat budget summary ────────────────────────────────────────────────────
+# beatsPerTC:       60
+# preamble (r1):    Pre-Encounter   4b  (round 1)
+# preamble (r2+):   Morale          4b  (round 2+)
+# tier budget:      56b  (60 − 4 preamble)
+# tier cost:         8b  (4b Action + 4b Response + 0b Resolution)
+# tier count:        7   (56 ÷ 8 = exactly 7)
+# system stages:     0b  (Surprise, Initiative, Resolution — computation only)

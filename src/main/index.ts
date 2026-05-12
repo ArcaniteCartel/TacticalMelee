@@ -41,12 +41,14 @@
 //   lanServer.ts          — WebSocket + HTTP server for Group HUD and future player clients
 //   ActivePlugin.ts       — Hardcoded Standard plugin config (beat budget, stage definitions)
 
-import { app, shell, BrowserWindow, session, ipcMain } from 'electron'
+import { app, shell, BrowserWindow, session, ipcMain, dialog } from 'electron'
 import { join } from 'path'
+import { writeFile } from 'fs/promises'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { createActor } from 'xstate'
 import { tcMachine } from './tc/tcMachine'
 import { ActivePlugin } from './plugins/ActivePlugin'
+import { PluginManager } from './plugins/PluginManager'
 import { createLanServer, LAN_PORT } from './server/lanServer'
 import { StageRegistry } from './stages/registry'
 import { StagePlanner } from './stages/stagePlanner'
@@ -58,16 +60,19 @@ import { isTimedStageType } from '../shared/types'
 
 // ── Singletons ──────────────────────────────────────────────────────────────
 
-let mainWindow: BrowserWindow | null = null
-let hudWindow:  BrowserWindow | null = null
+let mainWindow:   BrowserWindow | null = null
+let hudWindow:    BrowserWindow | null = null
+let editorWindow: BrowserWindow | null = null
 
-const activePlugin  = new ActivePlugin()
-const tcActor       = createActor(tcMachine)
-const lanServer     = createLanServer()
-// StagePlanner expands the Action Tier triad to fill the round's beat budget.
-// Constructed once from the plugin's minimum timer floor so the floor is consistent
-// for the lifetime of the app (plugin config does not change at runtime).
-const stagePlanner  = new StagePlanner(activePlugin.getConfig().minAdjustedTimerSeconds)
+// activePlugin holds the hardcoded standard config; PluginManager is the runtime
+// authority and may redirect to a custom YAML. All IPC handlers that need the live
+// config go through pluginManager.getActivePluginConfig().
+const activePlugin    = new ActivePlugin()
+const pluginManager   = new PluginManager()
+const tcActor         = createActor(tcMachine)
+const lanServer       = createLanServer()
+// StagePlanner is let so it can be replaced after a live plugin reload (SUBMIT when idle).
+let   stagePlanner    = new StagePlanner(activePlugin.getConfig().minAdjustedTimerSeconds)
 
 // BattleLedger tracks beat log history with a Memento snapshot stack so that
 // Stage Reset and Tier Reset can roll the log back consistently with the machine.
@@ -676,13 +681,12 @@ tcActor.start()
 // Filter stages for round 1, expand the pipeline via StagePlanner, then start the machine.
 // beatsPerTC initialises the beat ledger (beatsRemaining = beatsAtStageEntry = beatsPerTC).
 ipcMain.on('tc:start-combat', () => {
-  const allStages  = activePlugin.getStages()
-  const beatsPerTC = activePlugin.getBeatsPerTC()
-  const filtered   = filterStagesForRound(allStages, 1)
-  const stages     = stagePlanner.plan(filtered, beatsPerTC)
+  const plugin     = pluginManager.getActivePluginConfig()
+  const filtered   = filterStagesForRound(plugin.stages, 1)
+  const stages     = stagePlanner.plan(filtered, plugin.beatsPerTC)
   battleLedger.reset()
   battleLedger.push('round')
-  tcActor.send({ type: 'START_COMBAT', stages, beatsPerTC })
+  tcActor.send({ type: 'START_COMBAT', stages, beatsPerTC: plugin.beatsPerTC })
 })
 
 // In stageGMHold: starts the player countdown. In stageActive: ends stage early;
@@ -750,8 +754,9 @@ ipcMain.on('tc:round-reset', () => {
   battleLedger.push('round')
   const snap    = tcActor.getSnapshot()
   const round   = snap.context.round
-  const filtered = filterStagesForRound(activePlugin.getStages(), round)
-  const stages   = stagePlanner.plan(filtered, activePlugin.getBeatsPerTC())
+  const plugin  = pluginManager.getActivePluginConfig()
+  const filtered = filterStagesForRound(plugin.stages, round)
+  const stages   = stagePlanner.plan(filtered, plugin.beatsPerTC)
   lastIpcOp = 'round-reset'
   tcActor.send({ type: 'ROUND_RESET', stages })
   lastIpcOp = null
@@ -761,8 +766,9 @@ ipcMain.on('tc:round-reset', () => {
 // resets beat ledger to totalBeats.
 ipcMain.on('tc:next-round', () => {
   const nextRound = tcActor.getSnapshot().context.round + 1
-  const filtered  = filterStagesForRound(activePlugin.getStages(), nextRound)
-  const stages    = stagePlanner.plan(filtered, activePlugin.getBeatsPerTC())
+  const plugin    = pluginManager.getActivePluginConfig()
+  const filtered  = filterStagesForRound(plugin.stages, nextRound)
+  const stages    = stagePlanner.plan(filtered, plugin.beatsPerTC)
   battleLedger.push('round')
   tcActor.send({ type: 'NEXT_ROUND', stages })
 })
@@ -807,6 +813,91 @@ ipcMain.on('tc:launch-hud', () => {
   })
 })
 
+// ── Plugin IPC handlers ──────────────────────────────────────────────────────
+
+// Opens the Plugin Profile Editor window. Singleton: focuses existing window if open.
+ipcMain.on('plugin:open-editor', () => {
+  if (editorWindow) {
+    editorWindow.focus()
+    return
+  }
+
+  editorWindow = new BrowserWindow({
+    width: 960,
+    height: 760,
+    title: 'TacticalMelee — Plugin Profile Editor',
+    autoHideMenuBar: true,
+    webPreferences: {
+      preload: join(__dirname, '../preload/index.js'),
+      sandbox: false,
+    },
+  })
+
+  if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
+    editorWindow.loadURL(`${process.env['ELECTRON_RENDERER_URL']}/editor.html`)
+  } else {
+    editorWindow.loadFile(join(__dirname, '../renderer/editor.html'))
+  }
+
+  editorWindow.on('closed', () => {
+    editorWindow = null
+  })
+})
+
+// Returns the active plugin config payload for the editor.
+ipcMain.handle('plugin:get-active-config', () => {
+  return pluginManager.getActiveConfigForEditor()
+})
+
+// Returns true when the XState machine is idle (safe to live-reload the plugin).
+ipcMain.handle('plugin:is-idle', () => {
+  return String(tcActor.getSnapshot().value) === 'idle'
+})
+
+// Saves the custom YAML to disk. Live-reloads the active plugin when idle.
+// Returns { ok, applied } where applied=true means the new config is already active.
+ipcMain.handle('plugin:save-custom', async (_, yaml: string) => {
+  try {
+    await pluginManager.saveCustom(yaml)
+    const idle = String(tcActor.getSnapshot().value) === 'idle'
+    if (idle) {
+      // Rebuild StagePlanner from the new config's floor.
+      const plugin  = pluginManager.getActivePluginConfig()
+      stagePlanner  = new StagePlanner(plugin.minAdjustedTimerSeconds)
+    }
+    // Broadcast mode change to all windows (GM Dashboard badge + editor header).
+    const mode = pluginManager.getMode()
+    mainWindow?.webContents.send('plugin:mode-changed', mode)
+    editorWindow?.webContents.send('plugin:mode-changed', mode)
+    return { ok: true, applied: idle }
+  } catch (err) {
+    return { ok: false, applied: false, error: String(err) }
+  }
+})
+
+// Archives the custom YAML and reverts to standard. Broadcasts the mode change.
+ipcMain.handle('plugin:restore-defaults', async () => {
+  const backupPath = await pluginManager.restoreDefaults()
+  // Revert StagePlanner to standard config floor.
+  stagePlanner = new StagePlanner(pluginManager.getActivePluginConfig().minAdjustedTimerSeconds)
+  const mode = pluginManager.getMode()
+  mainWindow?.webContents.send('plugin:mode-changed', mode)
+  editorWindow?.webContents.send('plugin:mode-changed', mode)
+  return { backupPath }
+})
+
+// Opens a native Save dialog and writes the provided YAML content to the chosen path.
+ipcMain.handle('plugin:download-yaml', async (_, yaml: string) => {
+  const { filePath, canceled } = await dialog.showSaveDialog(editorWindow ?? mainWindow!, {
+    title: 'Save Plugin YAML',
+    defaultPath: 'custom-plugin.yaml',
+    filters: [{ name: 'YAML Files', extensions: ['yaml', 'yml'] }],
+  })
+  if (!canceled && filePath) {
+    await writeFile(filePath, yaml, 'utf8')
+  }
+})
+
 // ── Window creation ─────────────────────────────────────────────────────────
 
 /** Creates the GM Dashboard window. Hidden until ready-to-show to avoid a white flash. */
@@ -839,7 +930,8 @@ function createWindow(): void {
 
 // ── App lifecycle ───────────────────────────────────────────────────────────
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  await pluginManager.initialize()
   electronApp.setAppUserModelId('com.tacticalmelee.app')
 
   // Content Security Policy injected on every response.
@@ -865,7 +957,10 @@ app.whenReady().then(() => {
 
   // Validate plugin configuration after window is ready so alerts can reach the GM console
   mainWindow?.once('ready-to-show', () => {
-    const { errors, warnings } = validateStagesRoundVisibility(activePlugin.getStages())
+    const plugin = pluginManager.getActivePluginConfig()
+    // Rebuild StagePlanner from the active plugin's floor (custom YAML may differ).
+    stagePlanner = new StagePlanner(plugin.minAdjustedTimerSeconds)
+    const { errors, warnings } = validateStagesRoundVisibility(plugin.stages)
     warnings.forEach(w => logger.warn({ warning: w }, 'Plugin config warning'))
     errors.forEach(e => gmAlert(`Plugin configuration error: ${e}`))
   })
