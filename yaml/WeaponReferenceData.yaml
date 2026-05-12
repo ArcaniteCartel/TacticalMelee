@@ -1,0 +1,199 @@
+# WeaponReferenceData.yaml
+#
+# Physical weapon reference data — one entry per weapon type.
+#
+# WHAT THIS IS:
+#   Stable, technique-independent properties of each weapon: its physical
+#   size class, inertial character, maneuverability, effective reach, and
+#   damage type signature. These values are constant for the weapon itself
+#   regardless of which combat package or technique is in use.
+#
+# WHAT THIS IS NOT:
+#   This file is NOT package data. It does not describe timing, line,
+#   targeting, wager, bind, or any other resolution parameter that belongs
+#   to a specific WPP profile. Those live in GenericWeaponPatternParameterCatalog_rich.yaml
+#   and WeaponSpecificTieredPackageCatalog_rich.yaml and are selected at
+#   Bout formation when a package is chosen. This file is consulted BEFORE
+#   any package is selected — it drives weapon-level decisions such as
+#   reach comparison, encumbrance, and damage-type filtering.
+#
+# SOURCE:
+#   Derived from weapon_size_profile, range_profile, and damage_type_profile
+#   fields that are consistent across every WPP profile belonging to each
+#   weapon type. Fields that varied across profiles would be flagged
+#   INCONSISTENT and set to null (none were found in this generation).
+
+weapons:
+
+  # --- Dagger ---
+  - weapon: dagger
+    size: very_small
+    inertia: low
+    maneuverability: high
+    reach: very_short
+    damage_primary: piercing
+    damage_secondary: cutting
+
+  # --- Short Sword ---
+  - weapon: short_sword
+    size: small
+    inertia: low
+    maneuverability: high
+    reach: short
+    damage_primary: cutting
+    damage_secondary: piercing
+
+  # --- Longsword ---
+  - weapon: longsword
+    size: medium
+    inertia: medium
+    maneuverability: medium
+    reach: medium
+    damage_primary: cutting
+    damage_secondary: piercing
+
+  # --- Great Sword ---
+  - weapon: great_sword
+    size: large
+    inertia: high
+    maneuverability: low
+    reach: long
+    damage_primary: cutting
+    damage_secondary: piercing
+
+  # --- Shield ---
+  - weapon: shield
+    size: medium
+    inertia: medium
+    maneuverability: medium
+    reach: short
+    damage_primary: blunt
+    damage_secondary: none
+
+  # --- War Hammer ---
+  - weapon: war_hammer
+    size: small
+    inertia: medium
+    maneuverability: medium
+    reach: short
+    damage_primary: blunt
+    damage_secondary: piercing
+
+  # --- Hammer ---
+  - weapon: hammer
+    size: small
+    inertia: medium
+    maneuverability: medium
+    reach: short
+    damage_primary: blunt
+    damage_secondary: none
+
+  # --- Axe ---
+  - weapon: axe
+    size: small
+    inertia: medium
+    maneuverability: medium
+    reach: short
+    damage_primary: cutting
+    damage_secondary: blunt
+
+  # --- Battle Axe ---
+  - weapon: battle_axe
+    size: medium
+    inertia: high
+    maneuverability: low
+    reach: medium
+    damage_primary: cutting
+    damage_secondary: blunt
+
+  # --- Spear ---
+  - weapon: spear
+    size: medium
+    inertia: low
+    maneuverability: medium
+    reach: long
+    damage_primary: piercing
+    damage_secondary: blunt
+
+  # --- Halberd ---
+  - weapon: halberd
+    size: large
+    inertia: high
+    maneuverability: low
+    reach: very_long
+    damage_primary: mixed
+    damage_secondary: piercing
+
+  # --- Bow ---
+  - weapon: bow
+    size: medium
+    inertia: low
+    maneuverability: medium
+    reach: very_long
+    damage_primary: piercing
+    damage_secondary: none
+
+  # --- Longbow ---
+  - weapon: longbow
+    size: large
+    inertia: medium
+    maneuverability: low
+    reach: very_long
+    damage_primary: piercing
+    damage_secondary: none
+
+  # --- Recurve Bow ---
+  - weapon: recurve_bow
+    size: medium
+    inertia: low
+    maneuverability: high
+    reach: very_long
+    damage_primary: piercing
+    damage_secondary: none
+
+  # --- Flail ---
+  - weapon: flail
+    size: medium
+    inertia: medium
+    maneuverability: low
+    reach: medium
+    damage_primary: blunt
+    damage_secondary: none
+
+  # --- Mace ---
+  - weapon: mace
+    size: small
+    inertia: medium
+    maneuverability: medium
+    reach: short
+    damage_primary: blunt
+    damage_secondary: none
+
+  # --- Staff ---
+  - weapon: staff
+    size: medium
+    inertia: low
+    maneuverability: high
+    reach: long
+    damage_primary: blunt
+    damage_secondary: none
+
+  # --- Grapple ---
+  - weapon: grapple
+    size: very_small
+    inertia: low
+    maneuverability: high
+    reach: very_short
+    damage_primary: blunt
+    damage_secondary: none
+
+# ============================================================
+# CONSISTENCY SUMMARY
+# ============================================================
+# All 18 weapon types passed the consistency check.
+# Every extracted field (size, inertia, maneuverability, reach,
+# damage_primary, damage_secondary) was identical across all WPP
+# profiles belonging to each weapon type.
+# No INCONSISTENT fields were found in this generation.
+# Total WPP profiles checked: 395 across 18 weapons.
+# ============================================================

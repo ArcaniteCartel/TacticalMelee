@@ -252,6 +252,9 @@ tcActor.send({ type: 'UPDATE_PIPELINE', stages: updatedStages })
 **The single source of truth for game mechanic configuration.** Currently hardcoded to
 the Standard plugin; future versions will load from YAML or a database.
 
+*Plugin YAML format and design (the planned replacement for the hardcoded implementation):
+`plugin-manager-design.md`.*
+
 **Responsibilities:**
 - Provides the full `PluginConfig` (stage definitions, beat budget, minimum timer floor)
 - All other modules query this class; none access plugin data directly
